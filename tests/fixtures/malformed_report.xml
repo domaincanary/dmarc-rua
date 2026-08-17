@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<feedback>
+  <report_metadata>
+    <org_name>  tiny-mta.example  </org_name>
+    <report_id>junk-0001</report_id>
+    <date_range>
+      <begin>1754956800</begin>
+      <end></end>
+    </date_range>
+  </report_metadata>
+  <policy_published>
+    <domain>example.com</domain>
+    <p>NONE</p>
+  </policy_published>
+  <record>
+    <row>
+      <source_ip>198.51.100.200</source_ip>
+      <count>5</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>fail</dkim>
+        <spf>pass</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+    </identifiers>
+    <auth_results>
+      <spf>
+        <domain>example.com</domain>
+        <result>pass</result>
+      </spf>
+    </auth_results>
+  </record>
+  <record>
+    <row>
+      <count>9</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+    </identifiers>
+  </record>
+</feedback>
