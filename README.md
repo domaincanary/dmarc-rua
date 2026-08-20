@@ -34,14 +34,15 @@ With Deno:
 deno add jsr:@domaincanary/dmarc-rua
 ```
 
-For a Node.js or Bun project using an npm package manager:
+For a Node.js or Bun project, straight from npm:
 
 ```sh
-npx jsr add @domaincanary/dmarc-rua
+npm install @domaincanary/dmarc-rua
 ```
 
-Both commands map the bare `@domaincanary/dmarc-rua` specifier, so the imports below work unchanged
-on every runtime.
+Either way, the bare `@domaincanary/dmarc-rua` imports below work unchanged on every runtime. The
+npm package is built from the same source, ships ESM with type declarations, and has two runtime
+dependencies, both with zero transitive dependencies and no install scripts.
 
 ## Parse a DMARC report file
 

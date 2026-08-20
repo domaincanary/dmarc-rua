@@ -1,22 +1,24 @@
 {
   "name": "@domaincanary/dmarc-rua",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "license": "MIT",
   "exports": {
     ".": "./src/parser.ts",
     "./email": "./src/email.ts"
   },
   "publish": {
-    "exclude": [".github"]
+    "exclude": [".github", "scripts", "npm"]
   },
   "imports": {
-    "@libs/xml": "jsr:@libs/xml@^8",
+    "@deno/dnt": "jsr:@deno/dnt@^0.42.1",
+    "@rgrove/parse-xml": "npm:@rgrove/parse-xml@^4.2",
     "@std/assert": "jsr:@std/assert@^1",
-    "@zip-js/zip-js": "jsr:@zip-js/zip-js@^2.8"
+    "@zip-js/zip-js": "npm:@zip.js/zip.js@^2.8"
   },
   "tasks": {
     "test": "deno test --allow-read=.",
-    "check": "deno check src/parser.ts src/email.ts"
+    "check": "deno check src/parser.ts src/email.ts",
+    "build:npm": "deno run --allow-read --allow-write=npm --allow-net=jsr.io,registry.npmjs.org --allow-env --allow-run=npm scripts/build_npm.ts"
   },
   "fmt": {
     "lineWidth": 100

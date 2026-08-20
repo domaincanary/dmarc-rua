@@ -24,7 +24,7 @@
  * @module
  */
 
-import { parse } from "@libs/xml";
+import { parseXml as rgroveParseXml, XmlCdata, XmlElement, XmlText } from "@rgrove/parse-xml";
 import { BlobReader, configure, type FileEntry, ZipReader } from "@zip-js/zip-js";
 import { isIP } from "node:net";
 import { GZIP_MAGIC, hasMagic, ZIP_MAGIC } from "./_internal.ts";
@@ -372,10 +372,39 @@ function decodeText(bytes: Uint8Array): string {
   return new TextDecoder("utf-8", { fatal: false }).decode(bytes).replace(/^\uFEFF/, "").trim();
 }
 
+function convertXmlElement(element: XmlElement): unknown {
+  const childElements = element.children.filter(
+    (child): child is XmlElement => child instanceof XmlElement,
+  );
+  const content = element.children
+    .filter(
+      (child): child is XmlText | XmlCdata => child instanceof XmlText || child instanceof XmlCdata,
+    )
+    .map((child) => child.text)
+    .join("");
+
+  if (childElements.length === 0) return content;
+
+  const converted: Node = {};
+  for (const child of childElements) {
+    const value = convertXmlElement(child);
+    const previous = converted[child.name];
+    if (previous === undefined) converted[child.name] = value;
+    else if (Array.isArray(previous)) previous.push(value);
+    else converted[child.name] = [previous, value];
+  }
+  if (content.trim() !== "") converted["#text"] = content;
+  return converted;
+}
+
 function parseXml(xml: string, budget: ParseBudget): ParsedReport {
   let doc: Node;
   try {
-    doc = parse(xml) as unknown as Node;
+    const document = rgroveParseXml(xml);
+    const root = document.children.find((child): child is XmlElement =>
+      child instanceof XmlElement
+    );
+    doc = root ? { [root.name]: convertXmlElement(root) } : {};
   } catch (e) {
     throw new ParseError(`invalid XML: ${errMessage(e)}`);
   }
