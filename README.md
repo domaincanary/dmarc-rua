@@ -1,8 +1,9 @@
 # dmarc-rua
 
-Parse DMARC aggregate (RUA) reports in TypeScript. `@domaincanary/dmarc-rua` turns the XML, gzipped
-XML, and zip report files that mailbox providers such as Google, Microsoft, and Yahoo send into
-typed records, on Deno, Node.js, Bun, and Cloudflare Workers.
+Parse DMARC aggregate (RUA) reports in TypeScript. `@domaincanary/dmarc-rua` is a DMARC RUA parser
+library for JavaScript and TypeScript that turns the XML, gzipped XML, and zip report files mailbox
+providers such as Google, Microsoft, and Yahoo send into typed records. It runs on Deno, Node.js,
+Bun, and Cloudflare Workers.
 
 The parser tolerates malformed records and applies shared decompression and record budgets, so
 hostile or oversized input cannot exhaust memory or CPU. The `@domaincanary/dmarc-rua/email` subpath
@@ -39,13 +40,16 @@ For a Node.js or Bun project using an npm package manager:
 npx jsr add @domaincanary/dmarc-rua
 ```
 
+Both commands map the bare `@domaincanary/dmarc-rua` specifier, so the imports below work unchanged
+on every runtime.
+
 ## Parse a DMARC report file
 
 Pass the bytes of an `.xml`, `.xml.gz`, or `.zip` file to `parsePayload`. A zip can contain more
 than one report, so the result is always an array.
 
 ```ts
-import { type ParsedReport, parsePayload } from "jsr:@domaincanary/dmarc-rua";
+import { type ParsedReport, parsePayload } from "@domaincanary/dmarc-rua";
 
 const bytes = await Deno.readFile("google.com!example.com!report.xml.gz");
 const reports: ParsedReport[] = await parsePayload(bytes, "report.xml.gz");
@@ -62,8 +66,8 @@ Cloudflare Email Workers do not provide Node mail libraries. The email subpath w
 support that API when the `nodejs_compat` compatibility flag is enabled.
 
 ```ts
-import { ParseBudget, type ParsedReport, parsePayload } from "jsr:@domaincanary/dmarc-rua";
-import { extractRecipient, parseEmailAttachments } from "jsr:@domaincanary/dmarc-rua/email";
+import { ParseBudget, type ParsedReport, parsePayload } from "@domaincanary/dmarc-rua";
+import { extractRecipient, parseEmailAttachments } from "@domaincanary/dmarc-rua/email";
 
 export default {
   async email(message: ForwardableEmailMessage): Promise<void> {
