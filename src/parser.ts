@@ -1,9 +1,25 @@
 import { parse } from "@libs/xml";
 import { BlobReader, configure, type FileEntry, ZipReader } from "@zip-js/zip-js";
 import { isIP } from "node:net";
-import { type ParsedRecord, type ParsedReport, ParseError } from "./types.ts";
+import {
+  type DkimAuthResult,
+  MAX_DKIM_AUTH_RESULTS_PER_RECORD,
+  MAX_POLICY_REASONS_PER_RECORD,
+  type ParsedRecord,
+  type ParsedReport,
+  ParseError,
+  type PolicyReason,
+} from "./types.ts";
 
-export { type ParsedRecord, type ParsedReport, ParseError } from "./types.ts";
+export {
+  type DkimAuthResult,
+  MAX_DKIM_AUTH_RESULTS_PER_RECORD,
+  MAX_POLICY_REASONS_PER_RECORD,
+  type ParsedRecord,
+  type ParsedReport,
+  ParseError,
+  type PolicyReason,
+} from "./types.ts";
 
 const DECOMPRESSION_INPUT_CHUNK = 16 * 1024;
 
@@ -41,6 +57,7 @@ const MAX_REPORT_ID_BYTES = 512;
 const MAX_DOMAIN_BYTES = 253;
 const MAX_ENVELOPE_FROM_BYTES = 320;
 const MAX_RESULT_BYTES = 64;
+const MAX_REASON_COMMENT_BYTES = 200;
 const MAX_POLICY_BYTES = 32;
 const MAX_RECORD_COUNT = 1_000_000_000;
 
@@ -341,7 +358,7 @@ function parseXml(xml: string, budget: ParseBudget): ParsedReport {
     }
     const raw = rawRecords[i];
     recordsParsed++;
-    const rec = parseRecord(raw);
+    const rec = parseRecord(raw, (count) => truncatedFields += count);
     if (rec) records.push(rec);
     else skippedRecords++;
   }
@@ -355,6 +372,8 @@ function parseXml(xml: string, budget: ParseBudget): ParsedReport {
       p: boundedNullable(lower(text(policy.p)), MAX_POLICY_BYTES, () => truncatedFields++),
       sp: boundedNullable(lower(text(policy.sp)), MAX_POLICY_BYTES, () => truncatedFields++),
       pct: toInt(policy.pct),
+      adkim: boundedNullable(lower(text(policy.adkim)), MAX_POLICY_BYTES, () => truncatedFields++),
+      aspf: boundedNullable(lower(text(policy.aspf)), MAX_POLICY_BYTES, () => truncatedFields++),
     },
     records,
     skippedRecords,
@@ -363,7 +382,7 @@ function parseXml(xml: string, budget: ParseBudget): ParsedReport {
   };
 }
 
-function parseRecord(raw: unknown): ParsedRecord | null {
+function parseRecord(raw: unknown, truncated: (count: number) => void): ParsedRecord | null {
   const rec = asNode(raw);
   if (!rec) return null;
 
@@ -378,7 +397,8 @@ function parseRecord(raw: unknown): ParsedRecord | null {
   const evaluated = asNode(row.policy_evaluated) ?? {};
   const identifiers = asNode(rec.identifiers) ?? {};
   const auth = asNode(rec.auth_results) ?? {};
-  const dkimAuth = asNode(first(auth.dkim)) ?? {};
+  const dkimAuthResults = parseDkimAuthResults(auth.dkim, truncated);
+  const dkimAuth = dkimAuthResults[0] ?? { domain: null, selector: null, result: null };
   const spfAuth = asNode(first(auth.spf)) ?? {};
 
   const values = {
@@ -404,11 +424,78 @@ function parseRecord(raw: unknown): ParsedRecord | null {
     tooLong(values.spfResult, MAX_RESULT_BYTES)
   ) return null;
 
+  // Parsed after the guards above: a record the caps are about to discard must count as
+  // skipped, not as skipped plus its reasons truncated.
+  const reasons = parseReasons(evaluated.reason, truncated);
+
   return {
     sourceIp,
     count,
     ...values,
+    dkimAuthResults,
+    reasons,
   };
+}
+
+function parseReasons(
+  value: unknown,
+  truncated: (count: number) => void,
+): PolicyReason[] {
+  const rawReasons = toArray(value);
+  if (rawReasons.length > MAX_POLICY_REASONS_PER_RECORD) {
+    truncated(rawReasons.length - MAX_POLICY_REASONS_PER_RECORD);
+  }
+  const reasons: PolicyReason[] = [];
+  const inspected = Math.min(rawReasons.length, MAX_POLICY_REASONS_PER_RECORD);
+  for (let i = 0; i < inspected; i++) {
+    const node = asNode(rawReasons[i]);
+    if (!node) continue;
+    const type = lower(text(node.type));
+    if (tooLong(type, MAX_RESULT_BYTES)) {
+      truncated(1);
+      continue;
+    }
+    const rawComment = text(node.comment);
+    const comment = rawComment === null ? null : truncateUtf8(rawComment, MAX_REASON_COMMENT_BYTES);
+    if (comment !== rawComment) truncated(1);
+    if (type === null && comment === null) continue;
+    reasons.push({ type, comment });
+  }
+  return reasons;
+}
+
+function parseDkimAuthResults(
+  value: unknown,
+  truncated: (count: number) => void,
+): DkimAuthResult[] {
+  const rawResults = toArray(value);
+  if (rawResults.length > MAX_DKIM_AUTH_RESULTS_PER_RECORD) {
+    truncated(rawResults.length - MAX_DKIM_AUTH_RESULTS_PER_RECORD);
+  }
+  const results: DkimAuthResult[] = [];
+  const inspected = Math.min(rawResults.length, MAX_DKIM_AUTH_RESULTS_PER_RECORD);
+  for (let i = 0; i < inspected; i++) {
+    const node = asNode(rawResults[i]);
+    if (!node) continue;
+    const authResult = {
+      domain: text(node.domain),
+      selector: text(node.selector),
+      result: lower(text(node.result)),
+    };
+    if (
+      authResult.domain === null && authResult.selector === null && authResult.result === null
+    ) continue;
+    if (
+      tooLong(authResult.domain, MAX_DOMAIN_BYTES) ||
+      tooLong(authResult.selector, MAX_DOMAIN_BYTES) ||
+      tooLong(authResult.result, MAX_RESULT_BYTES)
+    ) {
+      truncated(1);
+      continue;
+    }
+    results.push(authResult);
+  }
+  return results;
 }
 
 function tooLong(value: string | null, maxBytes: number): boolean {

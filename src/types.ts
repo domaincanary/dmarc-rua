@@ -4,15 +4,40 @@ export interface ParsedReport {
   reportId: string;
   dateBegin: number; // unix seconds
   dateEnd: number; // unix seconds
-  policy: { p: string | null; sp: string | null; pct: number | null };
+  policy: {
+    p: string | null;
+    sp: string | null;
+    pct: number | null;
+    adkim?: string | null;
+    aspf?: string | null;
+  };
   records: ParsedRecord[];
   /** count of <record> elements skipped because they were malformed */
   skippedRecords: number;
   /** record elements actually examined before a shared record budget stopped parsing */
   recordsParsed?: number;
-  /** attacker-controlled metadata strings shortened to their storage bounds */
+  /** attacker-controlled fields shortened or discarded before storage */
   truncatedFields?: number;
 }
+
+export interface DkimAuthResult {
+  domain: string | null;
+  selector: string | null;
+  result: string | null;
+}
+
+export interface PolicyReason {
+  type: string | null;
+  comment: string | null;
+}
+
+// DKIM auth results past this position are dropped, and each dropped one is counted in
+// ParsedReport.truncatedFields.
+export const MAX_DKIM_AUTH_RESULTS_PER_RECORD: number = 10;
+
+// Policy override reasons past this position are dropped, and each dropped one is counted in
+// ParsedReport.truncatedFields.
+export const MAX_POLICY_REASONS_PER_RECORD: number = 5;
 
 export interface ParsedRecord {
   sourceIp: string;
@@ -24,6 +49,9 @@ export interface ParsedRecord {
   envelopeFrom: string | null;
   dkimDomain: string | null;
   dkimResult: string | null; // raw auth result
+  /** Complete ordered DKIM auth results. Absent only on records built by older callers. */
+  dkimAuthResults?: DkimAuthResult[];
+  reasons?: PolicyReason[];
   spfDomain: string | null;
   spfResult: string | null; // raw auth result
 }

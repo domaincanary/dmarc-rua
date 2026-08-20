@@ -112,10 +112,13 @@ Returns the lowercased envelope recipient when available, preferring `X-Original
 
 ### Types
 
-The root export provides `ParsedReport`, `ParsedRecord`, and `ParseError`. `ParsedReport` includes
-report metadata, published policy, parsed records, and partial-recovery counters. `ParsedRecord`
-contains the source IP, message count, evaluated DMARC results, identifiers, and authentication
-results. The email subpath exports `EmailAttachment`, whose fields are `bytes` and an optional
-`filename`.
+The root export provides `ParsedReport`, `ParsedRecord`, `DkimAuthResult`, `PolicyReason`, and
+`ParseError`. `ParsedReport` includes report metadata, published policy (including `adkim` and
+`aspf` alignment modes), parsed records, and partial-recovery counters. `ParsedRecord` contains the
+source IP, message count, evaluated DMARC results, identifiers, authentication results, the complete
+ordered DKIM auth results in `dkimAuthResults` (capped at `MAX_DKIM_AUTH_RESULTS_PER_RECORD`), and
+policy override reasons in `reasons` (capped at `MAX_POLICY_REASONS_PER_RECORD`). Entries dropped by
+either cap are counted in `truncatedFields`. The email subpath exports `EmailAttachment`, whose
+fields are `bytes` and an optional `filename`.
 
 This library powers DMARC monitoring at [DomainCanary](https://domaincanary.com).

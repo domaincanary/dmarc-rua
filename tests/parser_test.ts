@@ -5,7 +5,11 @@ import {
   ParseBudget,
   parsePayload,
 } from "../src/parser.ts";
-import { ParseError } from "../src/types.ts";
+import {
+  MAX_DKIM_AUTH_RESULTS_PER_RECORD,
+  MAX_POLICY_REASONS_PER_RECORD,
+  ParseError,
+} from "../src/types.ts";
 import { fixtureBytes, fixtureText, gzip, gzipZeros, zip, zipRaw } from "./fixtures/helpers.ts";
 
 const GOOGLE = "google_report.xml";
@@ -36,7 +40,13 @@ Deno.test("parsePayload: raw XML metadata and policy", async () => {
   assertEquals(report.reportId, "10248281564572151122");
   assertEquals(report.dateBegin, 1754956800);
   assertEquals(report.dateEnd, 1755043199);
-  assertEquals(report.policy, { p: "quarantine", sp: "none", pct: 100 });
+  assertEquals(report.policy, {
+    p: "quarantine",
+    sp: "none",
+    pct: 100,
+    adkim: "r",
+    aspf: "r",
+  });
   assertEquals(report.records.length, 3);
   assertEquals(report.skippedRecords, 0);
 });
@@ -53,10 +63,14 @@ Deno.test("parsePayload: record field mapping", async () => {
     envelopeFrom: "example.com",
     dkimDomain: "example.com",
     dkimResult: "pass",
+    dkimAuthResults: [
+      { domain: "example.com", selector: "google", result: "pass" },
+    ],
+    reasons: [],
     spfDomain: "example.com",
     spfResult: "pass",
   });
-  // second record: failing, no envelope_from, two <dkim> auth results -> first one wins
+  // second record: failing, no envelope_from, and two DKIM auth results
   assertEquals(report.records[1], {
     sourceIp: "198.51.100.7",
     count: 3,
@@ -67,6 +81,11 @@ Deno.test("parsePayload: record field mapping", async () => {
     envelopeFrom: null,
     dkimDomain: "bounce.mailer.test",
     dkimResult: "fail",
+    dkimAuthResults: [
+      { domain: "bounce.mailer.test", selector: "s1", result: "fail" },
+      { domain: "second.mailer.test", selector: null, result: "none" },
+    ],
+    reasons: [],
     spfDomain: "bounce.mailer.test",
     spfResult: "softfail",
   });
@@ -132,14 +151,150 @@ Deno.test("parsePayload: malformed records are skipped and counted", async () =>
   const [report] = await parsePayload(malformedWithEnd(), MALFORMED);
   assertEquals(report.orgName, "tiny-mta.example");
   assertEquals(report.dateEnd, 1755043199);
-  assertEquals(report.policy, { p: "none", sp: null, pct: null });
+  assertEquals(report.policy, { p: "none", sp: null, pct: null, adkim: null, aspf: null });
   assertEquals(report.skippedRecords, 1);
   assertEquals(report.records.length, 1);
   assertEquals(report.records[0].sourceIp, "198.51.100.200");
   assertEquals(report.records[0].count, 5);
   assertEquals(report.records[0].dkimDomain, null);
   assertEquals(report.records[0].dkimResult, null);
+  assertEquals(report.records[0].dkimAuthResults, []);
+  assertEquals(report.records[0].reasons, []);
   assertEquals(report.records[0].spfResult, "pass");
+});
+
+Deno.test("parsePayload: malformed and missing DKIM selectors become null", async () => {
+  const xml = fixtureText(GOOGLE).replace(
+    "<selector>s1</selector>",
+    "<selector><broken /></selector>",
+  );
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records[1].dkimAuthResults, [
+    { domain: "bounce.mailer.test", selector: null, result: "fail" },
+    { domain: "second.mailer.test", selector: null, result: "none" },
+  ]);
+});
+
+Deno.test("parsePayload: drops all-null DKIM auth results", async () => {
+  const xml = `<feedback><report_metadata><date_range><end>2</end></date_range></report_metadata>
+    <record><row><source_ip>192.0.2.8</source_ip><count>1</count></row>
+      <auth_results><dkim><junk /></dkim></auth_results></record></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records.length, 1);
+  assertEquals(report.records[0].dkimAuthResults, []);
+});
+
+Deno.test("parsePayload: caps DKIM auth results and reports truncation", async () => {
+  const entries = Array.from(
+    { length: MAX_DKIM_AUTH_RESULTS_PER_RECORD + 4 },
+    (_, i) =>
+      `<dkim><domain>d${i}.example</domain><selector>s${i}</selector>` +
+      `<result>pass</result></dkim>`,
+  ).join("");
+  const xml = `<feedback><report_metadata><date_range><end>2</end></date_range></report_metadata>
+    <record><row><source_ip>192.0.2.9</source_ip><count>1</count></row>
+      <auth_results>${entries}</auth_results></record></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records[0].dkimAuthResults?.length, MAX_DKIM_AUTH_RESULTS_PER_RECORD);
+  assertEquals(report.truncatedFields, 4);
+});
+
+Deno.test("parsePayload: drops only an oversized DKIM auth result", async () => {
+  const oversized = "s".repeat(254);
+  const xml = `<feedback><report_metadata><date_range><end>2</end></date_range></report_metadata>
+    <record><row><source_ip>192.0.2.10</source_ip><count>1</count></row><auth_results>
+      <dkim><domain>bad.example</domain><selector>${oversized}</selector><result>pass</result></dkim>
+      <dkim><domain>good.example</domain><selector>good</selector><result>pass</result></dkim>
+    </auth_results></record></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records.length, 1);
+  assertEquals(report.skippedRecords, 0);
+  assertEquals(report.truncatedFields, 1);
+  assertEquals(report.records[0].dkimDomain, "good.example");
+  assertEquals(report.records[0].dkimResult, "pass");
+  assertEquals(report.records[0].dkimAuthResults, [
+    { domain: "good.example", selector: "good", result: "pass" },
+  ]);
+});
+
+Deno.test("parsePayload: skips junk text before the first parseable DKIM result", async () => {
+  const xml = `<feedback><report_metadata><date_range><end>2</end></date_range></report_metadata>
+    <record><row><source_ip>192.0.2.11</source_ip><count>1</count></row><auth_results>
+      <dkim>oops</dkim>
+      <dkim><domain>real.example</domain><selector>real</selector><result>pass</result></dkim>
+    </auth_results></record></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records[0].dkimDomain, "real.example");
+  assertEquals(report.records[0].dkimAuthResults, [
+    { domain: "real.example", selector: "real", result: "pass" },
+  ]);
+});
+
+Deno.test("parsePayload: captures ordered policy override reasons", async () => {
+  const xml = `<feedback><report_metadata><date_range><end>2</end></date_range></report_metadata>
+    <record><row><source_ip>192.0.2.12</source_ip><count>1</count><policy_evaluated>
+      <reason><type>Forwarded</type><comment>trusted relay</comment></reason>
+      <reason><type>MAILING_LIST</type><comment>list expansion</comment></reason>
+    </policy_evaluated></row></record></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records[0].reasons, [
+    { type: "forwarded", comment: "trusted relay" },
+    { type: "mailing_list", comment: "list expansion" },
+  ]);
+});
+
+Deno.test("parsePayload: caps policy reasons and reports truncation", async () => {
+  const reasons = Array.from(
+    { length: MAX_POLICY_REASONS_PER_RECORD + 1 },
+    (_, i) => `<reason><type>reason${i}</type></reason>`,
+  ).join("");
+  const xml = `<feedback><report_metadata><date_range><end>2</end></date_range></report_metadata>
+    <record><row><source_ip>192.0.2.13</source_ip><count>1</count>
+      <policy_evaluated>${reasons}</policy_evaluated></row></record></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records[0].reasons?.length, MAX_POLICY_REASONS_PER_RECORD);
+  assertEquals(report.truncatedFields, 1);
+});
+
+Deno.test("parsePayload: truncates an oversized policy reason comment", async () => {
+  const comment = "c".repeat(201);
+  const xml = `<feedback><report_metadata><date_range><end>2</end></date_range></report_metadata>
+    <record><row><source_ip>192.0.2.14</source_ip><count>1</count><policy_evaluated>
+      <reason><type>sampled_out</type><comment>${comment}</comment></reason>
+    </policy_evaluated></row></record></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records[0].reasons, [
+    { type: "sampled_out", comment: "c".repeat(200) },
+  ]);
+  assertEquals(report.truncatedFields, 1);
+});
+
+Deno.test("parsePayload: drops only a policy reason with an oversized type", async () => {
+  const xml = `<feedback><report_metadata><date_range><end>2</end></date_range></report_metadata>
+    <record><row><source_ip>192.0.2.15</source_ip><count>1</count><policy_evaluated>
+      <reason><type>${"x".repeat(65)}</type><comment>dropped too</comment></reason>
+      <reason><type>forwarded</type></reason>
+    </policy_evaluated></row></record></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records[0].reasons, [{ type: "forwarded", comment: null }]);
+  assertEquals(report.truncatedFields, 1);
+});
+
+Deno.test("parsePayload: captures alignment modes and treats missing modes as unknown", async () => {
+  const withModes =
+    `<feedback><report_metadata><date_range><end>2</end></date_range></report_metadata>
+    <policy_published><adkim>S</adkim><aspf>R</aspf></policy_published></feedback>`;
+  const [present] = await parsePayload(new TextEncoder().encode(withModes));
+  assertEquals(present.policy.adkim, "s");
+  assertEquals(present.policy.aspf, "r");
+  assertEquals(present.truncatedFields, undefined);
+
+  const withoutModes = `<feedback><report_metadata><date_range><end>2</end></date_range>
+    </report_metadata><policy_published><p>none</p></policy_published></feedback>`;
+  const [absent] = await parsePayload(new TextEncoder().encode(withoutModes));
+  assertEquals(absent.policy.adkim, null);
+  assertEquals(absent.policy.aspf, null);
+  assertEquals(absent.truncatedFields, undefined);
 });
 
 Deno.test("parsePayload: non-positive or non-numeric counts are skipped", async () => {
