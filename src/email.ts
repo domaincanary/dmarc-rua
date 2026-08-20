@@ -31,6 +31,8 @@
  * @module
  */
 
+import { GZIP_MAGIC, hasMagic, ZIP_MAGIC } from "./_internal.ts";
+
 /** Hard cap on how much of a message we will even look at. Real report mail is far smaller. */
 export const MAX_EMAIL_BYTES: number = 10 * 1024 * 1024;
 
@@ -64,9 +66,8 @@ export interface EmailAttachment {
  */
 export function parseEmailAttachments(raw: Uint8Array): EmailAttachment[] {
   try {
-    const text = binaryString(raw.subarray(0, MAX_EMAIL_BYTES));
     const found: Part[] = [];
-    walkPart(text, 0, { parts: 0 }, found);
+    walkPart(boundedText(raw), 0, { parts: 0 }, found);
     const primary = found.filter((p) => p.primary);
     const chosen = primary.length > 0 ? primary : found;
     return chosen.map((p) =>
@@ -89,8 +90,7 @@ export function parseEmailAttachments(raw: Uint8Array): EmailAttachment[] {
  */
 export function extractRecipient(raw: Uint8Array): string | null {
   try {
-    const text = binaryString(raw.subarray(0, MAX_EMAIL_BYTES));
-    const headers = parseHeaders(headerBlockOf(text));
+    const headers = parseHeaders(headerBlockOf(boundedText(raw)));
     for (const name of ["x-original-to", "delivered-to", "to"]) {
       for (const value of headers.get(name) ?? []) {
         const addr = firstAddress(value);
@@ -114,7 +114,7 @@ interface Budget {
   parts: number;
 }
 
-function walkPart(section: string, depth: number, budget: Budget, out: Part[]) {
+function walkPart(section: string, depth: number, budget: Budget, out: Part[]): void {
   if (depth > MAX_DEPTH || budget.parts >= MAX_PARTS) return;
   budget.parts++;
 
@@ -215,8 +215,7 @@ function looksLikeReport(
 }
 
 function sniffsAsReport(bytes: Uint8Array): boolean {
-  if (bytes[0] === 0x1f && bytes[1] === 0x8b) return true; // gzip
-  if (bytes[0] === 0x50 && bytes[1] === 0x4b) return true; // zip
+  if (hasMagic(bytes, GZIP_MAGIC) || hasMagic(bytes, ZIP_MAGIC)) return true;
   // A UTF-8 BOM is three bytes here, not one character, because this is a binary string.
   const head = binaryString(bytes.subarray(0, 512))
     .replace(/^\xEF\xBB\xBF/, "")
@@ -259,9 +258,10 @@ function parseHeaders(block: string): Map<string, string[]> {
     if (colon <= 0) continue; // mbox "From " lines, garbage, and body text all land here
     const name = line.slice(0, colon).trim().toLowerCase();
     if (!/^[!-9;-~]+$/.test(name)) continue; // printable ASCII, no colon, no space
-    const values = headers.get(name);
-    if (values) values.push(line.slice(colon + 1).trim());
-    else headers.set(name, [line.slice(colon + 1).trim()]);
+    const value = line.slice(colon + 1).trim();
+    const seen = headers.get(name);
+    if (seen) seen.push(value);
+    else headers.set(name, [value]);
   }
   return headers;
 }
@@ -431,6 +431,11 @@ function decodeQuotedPrintable(text: string): string {
 // "binary string": one JavaScript char per byte. TextDecoder is deliberately not used —
 // every label for latin1 aliases windows-1252, which mangles 0x80-0x9f and would corrupt
 // any 8bit or binary attachment on the way back out.
+
+/** The prefix of a message we are willing to read, as a binary string. */
+function boundedText(raw: Uint8Array): string {
+  return binaryString(raw.subarray(0, MAX_EMAIL_BYTES));
+}
 
 function binaryString(bytes: Uint8Array): string {
   const CHUNK = 8192;

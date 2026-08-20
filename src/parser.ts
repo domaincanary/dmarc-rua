@@ -27,6 +27,7 @@
 import { parse } from "@libs/xml";
 import { BlobReader, configure, type FileEntry, ZipReader } from "@zip-js/zip-js";
 import { isIP } from "node:net";
+import { GZIP_MAGIC, hasMagic, ZIP_MAGIC } from "./_internal.ts";
 import {
   type DkimAuthResult,
   MAX_DKIM_AUTH_RESULTS_PER_RECORD,
@@ -53,8 +54,6 @@ configure({ useWebWorkers: false, chunkSize: DECOMPRESSION_INPUT_CHUNK });
 
 type Node = Record<string, unknown>;
 
-const GZIP_MAGIC = [0x1f, 0x8b];
-const ZIP_MAGIC = [0x50, 0x4b];
 const DEFAULT_LIMITS: Readonly<{ decompressedBytes: number; records: number }> = {
   decompressedBytes: 64 * 1024 * 1024,
   records: 50_000,
@@ -75,6 +74,10 @@ export const MAX_RECORDS_PER_EMAIL: number = DEFAULT_LIMITS.records;
 
 /** Hard cap on zip members, so an archive of many tiny entries cannot burn CPU either. */
 const MAX_ZIP_ENTRIES = 64;
+
+/** The only two zip compression methods report mail uses (APPNOTE 4.4.5). */
+const ZIP_METHOD_STORED = 0;
+const ZIP_METHOD_DEFLATED = 8;
 
 /** A day, the RUA convention for a report window, used when only <end> is usable. */
 const DEFAULT_WINDOW_SECONDS = 86400;
@@ -180,7 +183,7 @@ export async function parsePayload(
 ): Promise<ParsedReport[]> {
   if (bytes.byteLength === 0) throw new ParseError("empty payload");
 
-  const kind = detect(bytes, filename);
+  const kind = detectFormat(bytes, filename);
   if (kind === "zip") return await parseZip(bytes, budget);
   if (kind === "gzip") return [parseXml(decodeText(await gunzip(bytes, budget)), budget)];
   budget.spendBytes(bytes.byteLength);
@@ -193,7 +196,7 @@ export async function parsePayload(
  */
 class BudgetError extends ParseError {}
 
-function detect(bytes: Uint8Array, filename?: string): "xml" | "gzip" | "zip" {
+function detectFormat(bytes: Uint8Array, filename?: string): "xml" | "gzip" | "zip" {
   if (hasMagic(bytes, GZIP_MAGIC)) return "gzip";
   if (hasMagic(bytes, ZIP_MAGIC)) return "zip";
   const name = (filename ?? "").toLowerCase();
@@ -202,17 +205,27 @@ function detect(bytes: Uint8Array, filename?: string): "xml" | "gzip" | "zip" {
   return "xml";
 }
 
-function hasMagic(bytes: Uint8Array, magic: number[]): boolean {
-  if (bytes.byteLength < magic.length) return false;
-  return magic.every((b, i) => bytes[i] === b);
-}
-
 /**
- * Inflate a gzip member by draining the decompression stream chunk by chunk, charging the
- * budget as we go. Buffering the whole output first (e.g. via Response.arrayBuffer) would
- * hand a decompression bomb the memory it is asking for before we could object.
+ * The one bounded decompression path, shared by gzip members and zip entries.
+ *
+ * The input is fed in fixed slices and the output drained chunk by chunk, with every chunk
+ * charged to the budget *before* it is retained. Handing the whole member to the stream at once
+ * would make it emit one output chunk covering the entire payload, so a bomb would be
+ * materialised in a single read no matter how carefully the loop counted; buffering the output
+ * first (e.g. via Response.arrayBuffer) would likewise hand it the memory it asked for before we
+ * could object.
+ *
+ * @param bytes The compressed input.
+ * @param format The stream format to inflate.
+ * @param label Names the payload in the error message raised for a corrupt stream.
+ * @param budget The budget charged for every byte of output.
  */
-async function gunzip(bytes: Uint8Array, budget: ParseBudget): Promise<Uint8Array> {
+async function inflate(
+  bytes: Uint8Array,
+  format: "gzip" | "deflate-raw",
+  label: string,
+  budget: ParseBudget,
+): Promise<Uint8Array> {
   let offset = 0;
   const source = new ReadableStream<BufferSource>({
     pull(controller) {
@@ -223,7 +236,7 @@ async function gunzip(bytes: Uint8Array, budget: ParseBudget): Promise<Uint8Arra
       offset += DECOMPRESSION_INPUT_CHUNK;
     },
   });
-  const reader = source.pipeThrough(new DecompressionStream("gzip")).getReader();
+  const reader = source.pipeThrough(new DecompressionStream(format)).getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   try {
@@ -237,9 +250,23 @@ async function gunzip(bytes: Uint8Array, budget: ParseBudget): Promise<Uint8Arra
   } catch (e) {
     await reader.cancel().catch(() => {});
     if (e instanceof ParseError) throw e;
-    throw new ParseError(`could not decompress gzip payload: ${errMessage(e)}`);
+    throw new ParseError(`could not decompress ${label}: ${errMessage(e)}`);
   }
   return concat(chunks, total);
+}
+
+/** Inflate a gzip member, charging its output to the budget as it emerges. */
+function gunzip(bytes: Uint8Array, budget: ParseBudget): Promise<Uint8Array> {
+  return inflate(bytes, "gzip", "gzip payload", budget);
+}
+
+/**
+ * Inflate the raw deflate stream of a zip entry. The entry's declared size is deliberately not
+ * passed to the inflater, so false central-directory metadata cannot defer the limit check until
+ * after a large output allocation.
+ */
+function inflateZipDeflate(bytes: Uint8Array, budget: ParseBudget): Promise<Uint8Array> {
+  return inflate(bytes, "deflate-raw", "zip entry", budget);
 }
 
 function concat(chunks: Uint8Array[], total: number): Uint8Array {
@@ -252,6 +279,13 @@ function concat(chunks: Uint8Array[], total: number): Uint8Array {
   return out;
 }
 
+/**
+ * Read one zip member out, in whichever form it was stored.
+ *
+ * The declared size is only ever used to reject an entry early: an entry claiming more than the
+ * budget has left is charged (and so throws) before any of its bytes are read. A declared size
+ * that lies low is harmless, because the actual output is charged either way.
+ */
 async function unzipEntry(entry: FileEntry, budget: ParseBudget): Promise<Uint8Array> {
   const declared = entry.uncompressedSize;
   if (
@@ -272,52 +306,14 @@ async function unzipEntry(entry: FileEntry, budget: ParseBudget): Promise<Uint8A
   await entry.getData(compressedOutput, { passThrough: true });
   const compressed = concat(compressedChunks, compressedTotal);
 
-  if (entry.compressionMethod === 0) {
+  if (entry.compressionMethod === ZIP_METHOD_STORED) {
     budget.spendBytes(compressed.byteLength);
     return compressed;
   }
-  if (entry.compressionMethod !== 8) {
+  if (entry.compressionMethod !== ZIP_METHOD_DEFLATED) {
     throw new ParseError(`unsupported zip compression method ${entry.compressionMethod}`);
   }
   return await inflateZipDeflate(compressed, budget);
-}
-
-/**
- * Feed raw deflate input in bounded slices and charge actual output as it emerges. A ZIP entry's
- * declared size is not passed to the inflater, so false central-directory metadata cannot defer
- * the limit check until after a large output allocation.
- */
-async function inflateZipDeflate(
-  bytes: Uint8Array,
-  budget: ParseBudget,
-): Promise<Uint8Array> {
-  let offset = 0;
-  const source = new ReadableStream<BufferSource>({
-    pull(controller) {
-      if (offset >= bytes.byteLength) return controller.close();
-      controller.enqueue(
-        bytes.subarray(offset, offset + DECOMPRESSION_INPUT_CHUNK) as BufferSource,
-      );
-      offset += DECOMPRESSION_INPUT_CHUNK;
-    },
-  });
-  const reader = source.pipeThrough(new DecompressionStream("deflate-raw")).getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      budget.spendBytes(value.byteLength);
-      chunks.push(value);
-      total += value.byteLength;
-    }
-  } catch (e) {
-    await reader.cancel().catch(() => {});
-    if (e instanceof ParseError) throw e;
-    throw new ParseError(`could not decompress zip entry: ${errMessage(e)}`);
-  }
-  return concat(chunks, total);
 }
 
 async function parseZip(bytes: Uint8Array, budget: ParseBudget): Promise<ParsedReport[]> {
@@ -388,28 +384,18 @@ function parseXml(xml: string, budget: ParseBudget): ParsedReport {
   if (!feedback) throw new ParseError("no <feedback> element found in report");
 
   const meta = asNode(feedback.report_metadata) ?? {};
-  const range = asNode(meta.date_range) ?? {};
   const policy = asNode(feedback.policy_published) ?? {};
+  const { dateBegin, dateEnd } = parseWindow(asNode(meta.date_range) ?? {});
 
-  // A report with no usable end date used to land at epoch 0, i.e. outside every digest
-  // window — stored but invisible. Reject it instead so the failure is reported at ingest.
-  const dateEnd = toInt(range.end) ?? 0;
-  if (dateEnd <= 0) {
-    throw new ParseError("report has a missing or invalid <date_range><end>");
-  }
-  if (dateEnd > Math.floor(Date.now() / 1000) + MAX_FUTURE_SKEW_SECONDS) {
-    throw new ParseError("report <date_range><end> is implausibly far in the future");
-  }
-  const rawBegin = toInt(range.begin) ?? 0;
-  const dateBegin = rawBegin > 0 && rawBegin <= dateEnd
-    ? Math.max(rawBegin, dateEnd - MAX_REPORT_WINDOW_SECONDS)
-    : dateEnd - DEFAULT_WINDOW_SECONDS;
   let truncatedFields = 0;
   const bounded = (value: string, maxBytes: number): string => {
     const result = truncateUtf8(value, maxBytes);
     if (result !== value) truncatedFields++;
     return result;
   };
+  const boundedOrNull = (value: string | null, maxBytes: number): string | null =>
+    value === null ? null : bounded(value, maxBytes);
+
   const orgName = bounded(text(meta.org_name) ?? "unknown", MAX_ORG_NAME_BYTES);
   const reportId = bounded(
     text(meta.report_id) ?? `${orgName}-${dateBegin}-${dateEnd}`,
@@ -425,10 +411,9 @@ function parseXml(xml: string, budget: ParseBudget): ParsedReport {
       skippedRecords += rawRecords.length - i;
       break;
     }
-    const raw = rawRecords[i];
     recordsParsed++;
-    const rec = parseRecord(raw, (count) => truncatedFields += count);
-    if (rec) records.push(rec);
+    const record = parseRecord(rawRecords[i], (count) => truncatedFields += count);
+    if (record) records.push(record);
     else skippedRecords++;
   }
 
@@ -438,11 +423,11 @@ function parseXml(xml: string, budget: ParseBudget): ParsedReport {
     dateBegin,
     dateEnd,
     policy: {
-      p: boundedNullable(lower(text(policy.p)), MAX_POLICY_BYTES, () => truncatedFields++),
-      sp: boundedNullable(lower(text(policy.sp)), MAX_POLICY_BYTES, () => truncatedFields++),
+      p: boundedOrNull(lowerText(policy.p), MAX_POLICY_BYTES),
+      sp: boundedOrNull(lowerText(policy.sp), MAX_POLICY_BYTES),
       pct: toInt(policy.pct),
-      adkim: boundedNullable(lower(text(policy.adkim)), MAX_POLICY_BYTES, () => truncatedFields++),
-      aspf: boundedNullable(lower(text(policy.aspf)), MAX_POLICY_BYTES, () => truncatedFields++),
+      adkim: boundedOrNull(lowerText(policy.adkim), MAX_POLICY_BYTES),
+      aspf: boundedOrNull(lowerText(policy.aspf), MAX_POLICY_BYTES),
     },
     records,
     skippedRecords,
@@ -451,7 +436,30 @@ function parseXml(xml: string, budget: ParseBudget): ParsedReport {
   };
 }
 
-function parseRecord(raw: unknown, truncated: (count: number) => void): ParsedRecord | null {
+/**
+ * Resolve the reporting window from a `<date_range>` node.
+ *
+ * A report with no usable end date used to land at epoch 0, i.e. outside every digest
+ * window — stored but invisible. Reject it instead so the failure is reported at ingest. A begin
+ * that is missing, out of order, or absurdly early is replaced rather than rejected: the window
+ * is derived from the end, which has already been vouched for.
+ */
+function parseWindow(range: Node): { dateBegin: number; dateEnd: number } {
+  const dateEnd = toInt(range.end) ?? 0;
+  if (dateEnd <= 0) {
+    throw new ParseError("report has a missing or invalid <date_range><end>");
+  }
+  if (dateEnd > Math.floor(Date.now() / 1000) + MAX_FUTURE_SKEW_SECONDS) {
+    throw new ParseError("report <date_range><end> is implausibly far in the future");
+  }
+  const rawBegin = toInt(range.begin) ?? 0;
+  const dateBegin = rawBegin > 0 && rawBegin <= dateEnd
+    ? Math.max(rawBegin, dateEnd - MAX_REPORT_WINDOW_SECONDS)
+    : dateEnd - DEFAULT_WINDOW_SECONDS;
+  return { dateBegin, dateEnd };
+}
+
+function parseRecord(raw: unknown, truncated: TruncationCounter): ParsedRecord | null {
   const rec = asNode(raw);
   if (!rec) return null;
 
@@ -466,32 +474,24 @@ function parseRecord(raw: unknown, truncated: (count: number) => void): ParsedRe
   const evaluated = asNode(row.policy_evaluated) ?? {};
   const identifiers = asNode(rec.identifiers) ?? {};
   const auth = asNode(rec.auth_results) ?? {};
+  // Parsed before the field guard below, unlike reasons: the first DKIM result feeds the bounded
+  // fields, so its truncation counts stick even when the guard then discards the record.
   const dkimAuthResults = parseDkimAuthResults(auth.dkim, truncated);
   const dkimAuth = dkimAuthResults[0] ?? { domain: null, selector: null, result: null };
   const spfAuth = asNode(first(auth.spf)) ?? {};
 
-  const values = {
-    disposition: lower(text(evaluated.disposition)),
-    dkim: lower(text(evaluated.dkim)),
-    spf: lower(text(evaluated.spf)),
+  const values: RecordStrings = {
+    disposition: lowerText(evaluated.disposition),
+    dkim: lowerText(evaluated.dkim),
+    spf: lowerText(evaluated.spf),
     headerFrom: text(identifiers.header_from),
     envelopeFrom: text(identifiers.envelope_from),
     dkimDomain: text(dkimAuth.domain),
-    dkimResult: lower(text(dkimAuth.result)),
+    dkimResult: lowerText(dkimAuth.result),
     spfDomain: text(spfAuth.domain),
-    spfResult: lower(text(spfAuth.result)),
+    spfResult: lowerText(spfAuth.result),
   };
-  if (
-    tooLong(values.disposition, MAX_RESULT_BYTES) ||
-    tooLong(values.dkim, MAX_RESULT_BYTES) ||
-    tooLong(values.spf, MAX_RESULT_BYTES) ||
-    tooLong(values.headerFrom, MAX_DOMAIN_BYTES) ||
-    tooLong(values.envelopeFrom, MAX_ENVELOPE_FROM_BYTES) ||
-    tooLong(values.dkimDomain, MAX_DOMAIN_BYTES) ||
-    tooLong(values.dkimResult, MAX_RESULT_BYTES) ||
-    tooLong(values.spfDomain, MAX_DOMAIN_BYTES) ||
-    tooLong(values.spfResult, MAX_RESULT_BYTES)
-  ) return null;
+  if (anyFieldTooLong(values)) return null;
 
   // Parsed after the guards above: a record the caps are about to discard must count as
   // skipped, not as skipped plus its reasons truncated.
@@ -506,86 +506,126 @@ function parseRecord(raw: unknown, truncated: (count: number) => void): ParsedRe
   };
 }
 
-function parseReasons(
-  value: unknown,
-  truncated: (count: number) => void,
-): PolicyReason[] {
-  const rawReasons = toArray(value);
-  if (rawReasons.length > MAX_POLICY_REASONS_PER_RECORD) {
-    truncated(rawReasons.length - MAX_POLICY_REASONS_PER_RECORD);
-  }
-  const reasons: PolicyReason[] = [];
-  const inspected = Math.min(rawReasons.length, MAX_POLICY_REASONS_PER_RECORD);
-  for (let i = 0; i < inspected; i++) {
-    const node = asNode(rawReasons[i]);
-    if (!node) continue;
-    const type = lower(text(node.type));
-    if (tooLong(type, MAX_RESULT_BYTES)) {
-      truncated(1);
-      continue;
-    }
-    const rawComment = text(node.comment);
-    const comment = rawComment === null ? null : truncateUtf8(rawComment, MAX_REASON_COMMENT_BYTES);
-    if (comment !== rawComment) truncated(1);
-    if (type === null && comment === null) continue;
-    reasons.push({ type, comment });
-  }
-  return reasons;
+/** The stored string fields of a record, each of which has a byte cap. */
+type RecordStrings = Pick<
+  ParsedRecord,
+  | "disposition"
+  | "dkim"
+  | "spf"
+  | "headerFrom"
+  | "envelopeFrom"
+  | "dkimDomain"
+  | "dkimResult"
+  | "spfDomain"
+  | "spfResult"
+>;
+
+/**
+ * Is any stored field over its cap? A record with one is dropped whole rather than shortened,
+ * which is why the caller runs this before anything about the record is counted as truncated.
+ */
+function anyFieldTooLong(values: RecordStrings): boolean {
+  return tooLong(values.disposition, MAX_RESULT_BYTES) ||
+    tooLong(values.dkim, MAX_RESULT_BYTES) ||
+    tooLong(values.spf, MAX_RESULT_BYTES) ||
+    tooLong(values.headerFrom, MAX_DOMAIN_BYTES) ||
+    tooLong(values.envelopeFrom, MAX_ENVELOPE_FROM_BYTES) ||
+    tooLong(values.dkimDomain, MAX_DOMAIN_BYTES) ||
+    tooLong(values.dkimResult, MAX_RESULT_BYTES) ||
+    tooLong(values.spfDomain, MAX_DOMAIN_BYTES) ||
+    tooLong(values.spfResult, MAX_RESULT_BYTES);
 }
 
-function parseDkimAuthResults(
+/** Counts fields shortened or dropped, for `ParsedReport.truncatedFields`. */
+type TruncationCounter = (count: number) => void;
+
+/**
+ * Parse a repeated child element under a per-record cap.
+ *
+ * Entries past `maxItems` are counted as truncated and never inspected, so a record carrying
+ * thousands of them costs one length check rather than thousands of parses. `parseItem` returns
+ * null for an entry to leave out, and counts the truncation itself when the omission was a cap
+ * rather than emptiness.
+ */
+function parseCappedList<T>(
   value: unknown,
-  truncated: (count: number) => void,
-): DkimAuthResult[] {
-  const rawResults = toArray(value);
-  if (rawResults.length > MAX_DKIM_AUTH_RESULTS_PER_RECORD) {
-    truncated(rawResults.length - MAX_DKIM_AUTH_RESULTS_PER_RECORD);
-  }
-  const results: DkimAuthResult[] = [];
-  const inspected = Math.min(rawResults.length, MAX_DKIM_AUTH_RESULTS_PER_RECORD);
+  maxItems: number,
+  truncated: TruncationCounter,
+  parseItem: (node: Node, truncated: TruncationCounter) => T | null,
+): T[] {
+  const raw = toArray(value);
+  if (raw.length > maxItems) truncated(raw.length - maxItems);
+  const items: T[] = [];
+  const inspected = Math.min(raw.length, maxItems);
   for (let i = 0; i < inspected; i++) {
-    const node = asNode(rawResults[i]);
+    const node = asNode(raw[i]);
     if (!node) continue;
-    const authResult = {
-      domain: text(node.domain),
-      selector: text(node.selector),
-      result: lower(text(node.result)),
-    };
-    if (
-      authResult.domain === null && authResult.selector === null && authResult.result === null
-    ) continue;
-    if (
-      tooLong(authResult.domain, MAX_DOMAIN_BYTES) ||
-      tooLong(authResult.selector, MAX_DOMAIN_BYTES) ||
-      tooLong(authResult.result, MAX_RESULT_BYTES)
-    ) {
-      truncated(1);
-      continue;
-    }
-    results.push(authResult);
+    const item = parseItem(node, truncated);
+    if (item !== null) items.push(item);
   }
-  return results;
+  return items;
+}
+
+function parseReasons(value: unknown, truncated: TruncationCounter): PolicyReason[] {
+  return parseCappedList(value, MAX_POLICY_REASONS_PER_RECORD, truncated, parseReason);
+}
+
+/**
+ * One `<reason>`. An over-length type drops the reason; an over-length comment is only shortened.
+ * Either way it counts as one truncated field.
+ */
+function parseReason(node: Node, truncated: TruncationCounter): PolicyReason | null {
+  const type = lowerText(node.type);
+  if (tooLong(type, MAX_RESULT_BYTES)) {
+    truncated(1);
+    return null;
+  }
+  const rawComment = text(node.comment);
+  const comment = rawComment === null ? null : truncateUtf8(rawComment, MAX_REASON_COMMENT_BYTES);
+  if (comment !== rawComment) truncated(1);
+  if (type === null && comment === null) return null;
+  return { type, comment };
+}
+
+function parseDkimAuthResults(value: unknown, truncated: TruncationCounter): DkimAuthResult[] {
+  return parseCappedList(value, MAX_DKIM_AUTH_RESULTS_PER_RECORD, truncated, parseDkimAuthResult);
+}
+
+/**
+ * One `<auth_results><dkim>`. An over-length field drops the entry and counts as truncated, but
+ * the emptiness check runs first on purpose: a reporter emitting `<dkim/>` has said nothing, and
+ * nothing is not a shortened something.
+ */
+function parseDkimAuthResult(node: Node, truncated: TruncationCounter): DkimAuthResult | null {
+  const authResult: DkimAuthResult = {
+    domain: text(node.domain),
+    selector: text(node.selector),
+    result: lowerText(node.result),
+  };
+  if (
+    authResult.domain === null && authResult.selector === null && authResult.result === null
+  ) return null;
+  if (
+    tooLong(authResult.domain, MAX_DOMAIN_BYTES) ||
+    tooLong(authResult.selector, MAX_DOMAIN_BYTES) ||
+    tooLong(authResult.result, MAX_RESULT_BYTES)
+  ) {
+    truncated(1);
+    return null;
+  }
+  return authResult;
 }
 
 function tooLong(value: string | null, maxBytes: number): boolean {
   return value !== null && new TextEncoder().encode(value).byteLength > maxBytes;
 }
 
-function boundedNullable(
-  value: string | null,
-  maxBytes: number,
-  truncated: () => void,
-): string | null {
-  if (value === null) return null;
-  const result = truncateUtf8(value, maxBytes);
-  if (result !== value) truncated();
-  return result;
-}
-
+/** Shorten `value` to at most `maxBytes` UTF-8 bytes, never splitting a character in half. */
 function truncateUtf8(value: string, maxBytes: number): string {
   const bytes = new TextEncoder().encode(value);
   if (bytes.byteLength <= maxBytes) return value;
   const decoder = new TextDecoder("utf-8", { fatal: true });
+  // A UTF-8 character is at most 4 bytes, so a valid boundary is within 3 bytes of the cap.
   for (let end = maxBytes; end >= Math.max(0, maxBytes - 3); end--) {
     try {
       return decoder.decode(bytes.subarray(0, end));
@@ -621,8 +661,10 @@ function text(value: unknown): string | null {
   return s === "" ? null : s;
 }
 
-function lower(value: string | null): string | null {
-  return value === null ? null : value.toLowerCase();
+/** The trimmed text of a node, lowercased: the form every result and policy value is stored in. */
+function lowerText(value: unknown): string | null {
+  const s = text(value);
+  return s === null ? null : s.toLowerCase();
 }
 
 function toInt(value: unknown): number | null {

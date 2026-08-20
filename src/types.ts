@@ -10,9 +10,9 @@ export interface ParsedReport {
   /** Reporter-assigned identifier for the report, from `<report_id>`. */
   reportId: string;
   /** Start of the reporting window, in unix seconds. */
-  dateBegin: number; // unix seconds
+  dateBegin: number;
   /** End of the reporting window, in unix seconds. */
-  dateEnd: number; // unix seconds
+  dateEnd: number;
   /** The DMARC policy the reporter saw published for the domain. */
   policy: {
     /** Requested policy for the domain, such as `none`, `quarantine` or `reject`. */
@@ -28,11 +28,11 @@ export interface ParsedReport {
   };
   /** The records parsed from the report, one per source IP and result combination. */
   records: ParsedRecord[];
-  /** count of <record> elements skipped because they were malformed */
+  /** Count of `<record>` elements rejected as malformed or left unparsed by the record budget. */
   skippedRecords: number;
-  /** record elements actually examined before a shared record budget stopped parsing */
+  /** Records actually examined, before a shared record budget stopped parsing. */
   recordsParsed?: number;
-  /** attacker-controlled fields shortened or discarded before storage */
+  /** Count of attacker-controlled fields shortened or discarded before storage. */
   truncatedFields?: number;
 }
 
@@ -75,12 +75,12 @@ export interface ParsedRecord {
   sourceIp: string;
   /** How many messages this record accounts for. */
   count: number;
-  /** The disposition the reporter applied to the messages. */
-  disposition: string | null; // none | quarantine | reject
-  /** The DMARC-evaluated DKIM result, which accounts for alignment. */
-  dkim: string | null; // policy-evaluated result: pass | fail
-  /** The DMARC-evaluated SPF result, which accounts for alignment. */
-  spf: string | null; // policy-evaluated result: pass | fail
+  /** The disposition the reporter applied: `none`, `quarantine` or `reject`. */
+  disposition: string | null;
+  /** The DMARC-evaluated DKIM result, which accounts for alignment: `pass` or `fail`. */
+  dkim: string | null;
+  /** The DMARC-evaluated SPF result, which accounts for alignment: `pass` or `fail`. */
+  spf: string | null;
   /** The domain in the `From:` header of the messages. */
   headerFrom: string | null;
   /** The envelope sender domain, when the reporter supplied one. */
@@ -88,7 +88,7 @@ export interface ParsedRecord {
   /** The signing domain of the first DKIM auth result, kept for convenience. */
   dkimDomain: string | null;
   /** The raw result of the first DKIM auth result, kept for convenience. */
-  dkimResult: string | null; // raw auth result
+  dkimResult: string | null;
   /** Complete ordered DKIM auth results. Absent only on records built by older callers. */
   dkimAuthResults?: DkimAuthResult[];
   /**
@@ -99,7 +99,7 @@ export interface ParsedRecord {
   /** The domain checked by SPF. */
   spfDomain: string | null;
   /** The raw SPF result, before DMARC alignment is applied. */
-  spfResult: string | null; // raw auth result
+  spfResult: string | null;
 }
 
 /** Thrown when no usable report can be extracted from a payload. */

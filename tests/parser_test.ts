@@ -362,6 +362,34 @@ Deno.test("parsePayload: bounds stored strings and counts truncation or rejected
   assertEquals(report.skippedRecords, 1);
 });
 
+Deno.test("parsePayload: bounding a field never splits a multi-byte character", async () => {
+  // Both fields end one byte over their cap with a two-byte character straddling it, so the
+  // truncation has to walk back to the preceding UTF-8 boundary rather than cutting at the cap.
+  const org = `${"o".repeat(254)}é`; // 256 bytes, cap 255
+  const id = `${"i".repeat(511)}é`; // 513 bytes, cap 512
+  const xml = `<feedback><report_metadata><org_name>${org}</org_name>
+    <report_id>${id}</report_id><date_range><begin>1</begin><end>2</end></date_range>
+    </report_metadata></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.orgName, "o".repeat(254));
+  assertEquals(report.reportId, "i".repeat(511));
+  assertEquals(report.truncatedFields, 2);
+});
+
+Deno.test("parsePayload: bounding walks back over 3- and 4-byte characters too", async () => {
+  // A 3-byte and a 4-byte code point straddle their caps, so the boundary walk-back has to step
+  // over more than one continuation byte to reach the preceding character boundary.
+  const org = `${"o".repeat(253)}€`; // 256 bytes, cap 255, straddles by one byte
+  const id = `${"i".repeat(510)}😀`; // 514 bytes, cap 512, straddles by two bytes
+  const xml = `<feedback><report_metadata><org_name>${org}</org_name>
+    <report_id>${id}</report_id><date_range><begin>1</begin><end>2</end></date_range>
+    </report_metadata></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.orgName, "o".repeat(253));
+  assertEquals(report.reportId, "i".repeat(510));
+  assertEquals(report.truncatedFields, 2);
+});
+
 Deno.test("parsePayload: single record is not treated as an array", async () => {
   const [report] = await parsePayload(fixtureBytes(YAHOO));
   assertEquals(report.records.length, 1);
