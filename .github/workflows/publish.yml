@@ -1,0 +1,41 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for JSR's tokenless OIDC publish
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Format
+        run: deno fmt --check
+
+      - name: Lint
+        run: deno lint
+
+      - name: Typecheck
+        run: deno task check
+
+      - name: Test
+        run: deno task test
+
+      - name: Verify tag matches deno.json version
+        run: |
+          version="$(deno eval 'console.log(JSON.parse(await Deno.readTextFile("deno.json")).version)')"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match deno.json version $version (expected tag v$version)" >&2
+            exit 1
+          fi
+
+      - name: Publish to JSR
+        run: deno publish

@@ -1,3 +1,29 @@
+/**
+ * Parses DMARC aggregate (RUA) report payloads into typed records.
+ *
+ * A payload may be XML, gzipped XML, or a zip archive holding one or more XML reports, and the
+ * format is detected from magic bytes first and the filename second. Every decompression path
+ * draws from a shared {@linkcode ParseBudget}, so a set of attachments from one message cannot
+ * expand past a single decompressed-byte cap or a single record cap. Malformed records are skipped
+ * rather than failing the whole report, and the honesty counters on {@linkcode ParsedReport}
+ * report how much was skipped or shortened so a caller can tell a complete report from a partially
+ * recovered one.
+ *
+ * @example
+ * ```ts
+ * import { type ParsedReport, parsePayload } from "@domaincanary/dmarc-rua";
+ *
+ * const bytes = await Deno.readFile("google.com!example.com!report.xml.gz");
+ * const reports: ParsedReport[] = await parsePayload(bytes, "report.xml.gz");
+ *
+ * for (const report of reports) {
+ *   console.log(report.orgName, report.reportId, report.records.length);
+ * }
+ * ```
+ *
+ * @module
+ */
+
 import { parse } from "@libs/xml";
 import { BlobReader, configure, type FileEntry, ZipReader } from "@zip-js/zip-js";
 import { isIP } from "node:net";
@@ -41,6 +67,10 @@ const DEFAULT_LIMITS: Readonly<{ decompressedBytes: number; records: number }> =
  */
 export const MAX_DECOMPRESSED_BYTES: number = DEFAULT_LIMITS.decompressedBytes;
 
+/**
+ * Hard cap on the records parsed for one email or ingest operation. Records past the cap are
+ * counted in {@linkcode ParsedReport.skippedRecords} rather than parsed.
+ */
 export const MAX_RECORDS_PER_EMAIL: number = DEFAULT_LIMITS.records;
 
 /** Hard cap on zip members, so an archive of many tiny entries cannot burn CPU either. */
@@ -61,13 +91,32 @@ const MAX_REASON_COMMENT_BYTES = 200;
 const MAX_POLICY_BYTES = 32;
 const MAX_RECORD_COUNT = 1_000_000_000;
 
+/**
+ * Tracks the shared decompressed-byte and record budgets for one email or ingest operation.
+ *
+ * The defaults are 64 MiB and 50,000 records. Pass custom limits to
+ * `new ParseBudget(decompressedBytes, records)`, and reuse the same instance across every
+ * attachment from one message so the caps apply to the message as a whole.
+ */
 export class ParseBudget {
+  /** Decompressed bytes still available to spend. */
   remainingDecompressedBytes: number;
+  /** Records still available to parse. */
   remainingRecords: number;
+  /** True once a payload asked for more decompressed bytes than the budget had left. */
   decompressionExceeded: boolean = false;
+  /** True once the record budget ran out. */
   recordLimitReached: boolean = false;
+  /** Payloads left unparsed because a budget was already exhausted, such as trailing zip members. */
   skippedPayloads: number = 0;
 
+  /**
+   * Create a budget, defaulting to {@linkcode MAX_DECOMPRESSED_BYTES} and
+   * {@linkcode MAX_RECORDS_PER_EMAIL}.
+   *
+   * @param decompressedBytes Total decompressed bytes this budget allows.
+   * @param records Total records this budget allows.
+   */
   constructor(
     decompressedBytes: number = DEFAULT_LIMITS.decompressedBytes,
     records: number = DEFAULT_LIMITS.records,
@@ -76,10 +125,17 @@ export class ParseBudget {
     this.remainingRecords = records;
   }
 
+  /** Whether the decompression budget is spent, either by overrun or by landing exactly on zero. */
   get decompressionLimitReached(): boolean {
     return this.decompressionExceeded || this.remainingDecompressedBytes === 0;
   }
 
+  /**
+   * Charge `n` decompressed bytes to the budget.
+   *
+   * @param n Bytes to charge. Negative and non-finite values are ignored.
+   * @throws {ParseError} When the charge exceeds the bytes remaining.
+   */
   spendBytes(n: number): void {
     if (!Number.isFinite(n) || n < 0) return;
     if (n > this.remainingDecompressedBytes) {
@@ -89,6 +145,11 @@ export class ParseBudget {
     this.remainingDecompressedBytes -= n;
   }
 
+  /**
+   * Claim one record from the budget.
+   *
+   * @returns True when a record was available, false once the record budget is spent.
+   */
   takeRecord(): boolean {
     if (this.remainingRecords <= 0) {
       this.recordLimitReached = true;
@@ -103,6 +164,14 @@ export class ParseBudget {
 /**
  * Parse a raw RUA payload (XML, gzipped XML, or a zip of XML files) into reports.
  * Throws ParseError when nothing usable can be extracted.
+ *
+ * A zip archive can hold more than one report, so the result is always an array.
+ *
+ * @param bytes The raw payload bytes.
+ * @param filename Optional filename, used for format detection when the magic bytes are absent.
+ * @param budget Shared budget to charge; pass one instance for every attachment of a message.
+ * @returns The reports recovered from the payload.
+ * @throws {ParseError} When no usable report can be extracted.
  */
 export async function parsePayload(
   bytes: Uint8Array,

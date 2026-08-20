@@ -9,6 +9,26 @@
  *
  * Written by hand rather than pulled from a registry on purpose: the grammar we need is small and
  * a MIME dependency would be a supply-chain risk sitting directly on hostile input.
+ *
+ * This is not a general email parser. It covers the MIME forms report mail actually uses: nested
+ * multipart bodies, base64, quoted-printable, RFC 2231 filenames, and bare XML or compressed
+ * bodies.
+ *
+ * @example
+ * ```ts
+ * import { extractRecipient, parseEmailAttachments } from "@domaincanary/dmarc-rua/email";
+ * import { parsePayload } from "@domaincanary/dmarc-rua";
+ *
+ * const raw = await Deno.readFile("report-mail.eml");
+ * const recipient = extractRecipient(raw);
+ *
+ * for (const attachment of parseEmailAttachments(raw)) {
+ *   const reports = await parsePayload(attachment.bytes, attachment.filename);
+ *   console.log(recipient, reports.length);
+ * }
+ * ```
+ *
+ * @module
  */
 
 /** Hard cap on how much of a message we will even look at. Real report mail is far smaller. */
@@ -23,8 +43,11 @@ const MAX_DEPTH = 8;
 /** Defensive cap on RFC 2231 continuation segments for one parameter. */
 const MAX_PARAM_SEGMENTS = 16;
 
+/** One candidate report attachment recovered from a message. */
 export interface EmailAttachment {
+  /** The declared filename, when the part carried one. */
   filename?: string;
+  /** The decoded attachment bytes, ready to hand to `parsePayload`. */
   bytes: Uint8Array;
 }
 
@@ -34,6 +57,10 @@ export interface EmailAttachment {
  * Parts that are plainly the human-readable covering note (text/plain, text/html) are held back
  * and only returned when nothing better was found, so the caller does not waste a parse attempt
  * on "Please find attached your DMARC report".
+ *
+ * @param raw The raw RFC 5322 message bytes.
+ * @returns Whatever could be recovered. Malformed input yields a short list or an empty one; this
+ * function does not throw.
  */
 export function parseEmailAttachments(raw: Uint8Array): EmailAttachment[] {
   try {
@@ -56,6 +83,9 @@ export function parseEmailAttachments(raw: Uint8Array): EmailAttachment[] {
  *
  * `X-Original-To` and `Delivered-To` are what an MTA stamps on with the *envelope* recipient, so
  * they survive the Bcc/alias/forwarding cases that `To:` does not. `To:` is the last resort.
+ *
+ * @param raw The raw RFC 5322 message bytes.
+ * @returns The lowercased recipient address, or null when no valid address can be recovered.
  */
 export function extractRecipient(raw: Uint8Array): string | null {
   try {
