@@ -56,7 +56,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
 
       - name: Build npm package with dnt
         run: deno task build:npm "${GITHUB_REF_NAME#v}"
@@ -77,8 +76,7 @@ jobs:
             console.log('smoke ok:', reports[0].orgName, reports[0].records.length, 'records');
           "
 
+      # Auth is npm trusted publishing (GitHub OIDC via id-token: write); no token anywhere.
       - name: Publish to npm
         run: npm publish --provenance --access public
         working-directory: npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
