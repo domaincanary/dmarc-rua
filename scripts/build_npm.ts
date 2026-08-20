@@ -25,6 +25,11 @@ await build({
   shims: {},
   test: false,
   scriptModule: false,
+  compilerOptions: {
+    // The source uses web platform globals (TextDecoder, Blob, DecompressionStream); dnt's
+    // default lib has no DOM, so the CI typecheck fails without these.
+    lib: ["ES2022", "DOM", "DOM.Iterable"],
+  },
   ...(Deno.env.get("DNT_NO_TYPES") === "1"
     ? { typeCheck: false as const, declaration: false as const, skipNpmInstall: true }
     : { typeCheck: "single" as const }),
@@ -54,6 +59,8 @@ await build({
     },
     bugs: { url: "https://github.com/domaincanary/dmarc-rua/issues" },
     engines: { node: ">=18" },
+    // Dev-only: gives the dnt typecheck declarations for the node:net import.
+    devDependencies: { "@types/node": "^24" },
   },
   postBuild() {
     Deno.copyFileSync("LICENSE", "npm/LICENSE");

@@ -1,6 +1,6 @@
 {
   "name": "@domaincanary/dmarc-rua",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "license": "MIT",
   "exports": {
     ".": "./src/parser.ts",
