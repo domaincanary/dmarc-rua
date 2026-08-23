@@ -80,3 +80,10 @@ jobs:
       - name: Publish to npm
         run: npm publish --provenance --access public
         working-directory: npm
+
+      # The unscoped alias re-exports the scoped package, so it publishes second: its exact-
+      # version dependency must already exist on the registry. Trusted publishing is configured
+      # per package name, so npmjs.com carries a second trusted-publisher entry for dmarc-rua.
+      - name: Publish unscoped alias to npm
+        run: npm publish --provenance --access public
+        working-directory: npm-alias

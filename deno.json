@@ -7,7 +7,7 @@
     "./email": "./src/email.ts"
   },
   "publish": {
-    "exclude": [".github", "scripts", "npm"]
+    "exclude": [".github", "scripts", "npm", "npm-alias"]
   },
   "imports": {
     "@deno/dnt": "jsr:@deno/dnt@^0.42.1",
@@ -18,7 +18,7 @@
   "tasks": {
     "test": "deno test --allow-read=.",
     "check": "deno check src/parser.ts src/email.ts",
-    "build:npm": "deno run --allow-read --allow-write=npm --allow-net=jsr.io,registry.npmjs.org --allow-env --allow-run=npm scripts/build_npm.ts"
+    "build:npm": "deno run --allow-read --allow-write=npm,npm-alias --allow-net=jsr.io,registry.npmjs.org --allow-env --allow-run=npm scripts/build_npm.ts"
   },
   "fmt": {
     "lineWidth": 100
