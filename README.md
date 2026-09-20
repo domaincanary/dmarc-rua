@@ -11,6 +11,10 @@ extracts candidate report attachments from the small MIME subset used by DMARC r
 RFC 5322 bytes can go in one end and parsed reports come out the other. It is not a general email
 parser.
 
+If you want the reports read for you,
+[DomainCanary](https://domaincanary.com/?ref=dmarc-rua-readme-header) is the hosted DMARC monitoring
+service built on this parser. Your first domain is free.
+
 - Parses DMARC aggregate report XML into typed `ParsedReport` and `ParsedRecord` objects
 - Accepts raw XML, `.xml.gz`, and `.zip` payloads, detecting the format from magic bytes
 - Surfaces SPF and DKIM authentication results, `adkim` and `aspf` alignment modes, and policy
@@ -97,6 +101,24 @@ Add the compatibility flag to `wrangler.jsonc`:
 }
 ```
 
+## Parse reports yourself, or have them read for you
+
+This library gives you parsed records. You still have to receive the mail, store the records, work
+out which service sits behind each IP address, and tell someone when a sender starts failing.
+[DomainCanary](https://domaincanary.com/signup?from=readme.which) is the hosted service we built on
+this parser, and it does those parts.
+
+|                   | dmarc-rua                                 | DomainCanary                                                                     |
+| ----------------- | ----------------------------------------- | -------------------------------------------------------------------------------- |
+| Who runs it       | You, in your own Worker, server or script | We do                                                                            |
+| Receiving reports | Your mailbox or Email Worker              | A reporting address for each domain                                              |
+| What you get      | Typed records from each report            | Every sending source matched to the service behind it, with pass and fail trends |
+| Alerts            | The ones you write                        | A Monday digest, and an email when your DMARC record changes                     |
+| History           | Whatever you store                        | 90 days of report detail on the free plan, 12 months on the Starter plan         |
+| Price             | Free, MIT                                 | Free for your first domain with no card, then from $19 a month for 3 domains     |
+
+[Start free with one domain](https://domaincanary.com/signup?from=readme.which).
+
 ## Hardening against hostile input
 
 DMARC report addresses are published in public DNS, so anything can mail them anything. Gzip and
@@ -146,5 +168,6 @@ policy override reasons in `reasons` (capped at `MAX_POLICY_REASONS_PER_RECORD`)
 either cap are counted in `truncatedFields`. The email subpath exports `EmailAttachment`, whose
 fields are `bytes` and an optional `filename`.
 
-This library powers [DMARC monitoring at DomainCanary](https://domaincanary.com), which alerts on
-authentication failures and DMARC record changes.
+This library powers
+[DMARC monitoring at DomainCanary](https://domaincanary.com/?ref=dmarc-rua-readme-footer), which
+alerts on authentication failures and DMARC record changes.
