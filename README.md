@@ -71,7 +71,7 @@ Cloudflare Email Workers do not provide Node mail libraries. The email subpath w
 support that API when the `nodejs_compat` compatibility flag is enabled.
 
 ```ts
-import { ParseBudget, type ParsedReport, parsePayload } from "@domaincanary/dmarc-rua";
+import { ParseBudget, type ParsedReport, ParseError, parsePayload } from "@domaincanary/dmarc-rua";
 import { extractRecipient, parseEmailAttachments } from "@domaincanary/dmarc-rua/email";
 
 export default {
@@ -83,9 +83,14 @@ export default {
     const reports: ParsedReport[] = [];
 
     for (const attachment of attachments) {
-      reports.push(
-        ...await parsePayload(attachment.bytes, attachment.filename, budget),
-      );
+      try {
+        reports.push(
+          ...await parsePayload(attachment.bytes, attachment.filename, budget),
+        );
+      } catch (e) {
+        // A candidate that is not a report, such as a logo image, throws ParseError. Skip it.
+        if (!(e instanceof ParseError)) throw e;
+      }
     }
 
     console.log({ recipient, reports });
@@ -136,21 +141,27 @@ recovered one.
 ### `parsePayload(bytes, filename?, budget?)`
 
 Parses raw XML, gzip, or zip bytes and returns `Promise<ParsedReport[]>`. Format detection uses
-magic bytes first and the optional filename second. It throws `ParseError` when no usable report can
-be extracted.
+magic bytes first and the optional filename second. XML is decoded as UTF-8 unless the document
+declares another encoding or opens with a UTF-16 byte order mark. It throws `ParseError` when no
+usable report can be extracted, which includes every attachment that is not a report, so catch it
+per attachment when parsing email.
 
 ### `ParseBudget`
 
 Tracks the shared decompressed-byte and record budgets for one email or ingest operation. The
 defaults are 64 MiB and 50,000 records. Pass custom limits to
 `new ParseBudget(decompressedBytes, records)`, and reuse the same instance across every attachment
-from one message.
+from one message. After parsing, `skippedPayloads`, `decompressionExceeded` and `recordLimitReached`
+on the budget say whether anything was left unparsed, such as trailing zip members. A report whose
+XML has far more elements than the remaining record budget could account for is rejected before it
+is parsed, because the element tree costs much more memory than the bytes it came from.
 
 ### `parseEmailAttachments(raw)`
 
 Returns `EmailAttachment[]` from raw RFC 5322 bytes. It handles the MIME forms needed for DMARC
-reports, including nested multipart bodies, base64, quoted-printable, RFC 2231 filenames, and bare
-XML or compressed bodies. Malformed input returns whatever can be recovered and does not throw.
+reports, including nested multipart bodies, reports forwarded as `message/rfc822` attachments,
+base64, quoted-printable, RFC 2231 filenames, and bare XML or compressed bodies. Malformed input
+returns whatever can be recovered and does not throw.
 
 ### `extractRecipient(raw)`
 
@@ -160,13 +171,14 @@ Returns the lowercased envelope recipient when available, preferring `X-Original
 ### Types
 
 The root export provides `ParsedReport`, `ParsedRecord`, `DkimAuthResult`, `PolicyReason`, and
-`ParseError`. `ParsedReport` includes report metadata, published policy (including `adkim` and
-`aspf` alignment modes), parsed records, and partial-recovery counters. `ParsedRecord` contains the
-source IP, message count, evaluated DMARC results, identifiers, authentication results, the complete
-ordered DKIM auth results in `dkimAuthResults` (capped at `MAX_DKIM_AUTH_RESULTS_PER_RECORD`), and
-policy override reasons in `reasons` (capped at `MAX_POLICY_REASONS_PER_RECORD`). Entries dropped by
-either cap are counted in `truncatedFields`. The email subpath exports `EmailAttachment`, whose
-fields are `bytes` and an optional `filename`.
+`ParseError`. `ParsedReport` includes report metadata, published policy (including the `domain` the
+report is about and the `adkim` and `aspf` alignment modes), parsed records, and partial-recovery
+counters. `ParsedRecord` contains the source IP, message count, evaluated DMARC results, identifiers
+(domains are lowercased), authentication results (the `mfrom` SPF result when a reporter lists
+several), the complete ordered DKIM auth results in `dkimAuthResults` (capped at
+`MAX_DKIM_AUTH_RESULTS_PER_RECORD`), and policy override reasons in `reasons` (capped at
+`MAX_POLICY_REASONS_PER_RECORD`). Entries dropped by either cap are counted in `truncatedFields`.
+The email subpath exports `EmailAttachment`, whose fields are `bytes` and an optional `filename`.
 
 This library powers
 [DMARC monitoring at DomainCanary](https://domaincanary.com/?ref=dmarc-rua-readme-footer), which

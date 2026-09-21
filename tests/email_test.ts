@@ -177,6 +177,46 @@ trailing note
   assertEquals(attachments[0].bytes, gz);
 });
 
+Deno.test("parseEmailAttachments finds the report inside a forwarded message/rfc822", async () => {
+  const gz = await gzip(fixtureText(YAHOO));
+  const raw = messageBytes(`From: admin@example.com
+X-Original-To: ${PUBLIC_ID}@rua.domaincanary.com
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary=outer
+
+--outer
+Content-Type: text/plain
+
+Forwarding this one.
+--outer
+Content-Type: message/rfc822
+Content-Disposition: attachment; filename="report.eml"
+
+From: noreply@reporter.example
+To: dmarc@example.com
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary=inner
+
+--inner
+Content-Type: text/plain
+
+This is a DMARC aggregate report.
+--inner
+Content-Type: application/gzip
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="forwarded.xml.gz"
+
+${base64Lines(gz)}
+--inner--
+--outer--
+`);
+
+  const attachments = parseEmailAttachments(raw);
+  assertEquals(attachments.length, 1);
+  assertEquals(attachments[0].filename, "forwarded.xml.gz");
+  assertEquals(attachments[0].bytes, gz);
+});
+
 Deno.test("parseEmailAttachments falls back to the text body when there is nothing else", () => {
   const raw = messageBytes(`From: a@example.net
 To: ${PUBLIC_ID}@rua.domaincanary.com
@@ -384,4 +424,13 @@ Deno.test("extractRecipient ignores an unparseable address and malformed input",
   assertEquals(extractRecipient(messageBytes("Subject: no recipient at all\n\nbody\n")), null);
   assertEquals(extractRecipient(new Uint8Array(0)), null);
   assertEquals(extractRecipient(new Uint8Array([0x00, 0xff, 0x41])), null);
+});
+
+Deno.test("extractRecipient ignores angle brackets and commas inside a quoted display name", () => {
+  const raw = messageBytes(`To: "Reports, <DMARC>" <Rua@Example.com>
+Subject: report
+
+body
+`);
+  assertEquals(extractRecipient(raw), "rua@example.com");
 });

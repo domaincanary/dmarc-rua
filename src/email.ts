@@ -11,20 +11,26 @@
  * a MIME dependency would be a supply-chain risk sitting directly on hostile input.
  *
  * This is not a general email parser. It covers the MIME forms report mail actually uses: nested
- * multipart bodies, base64, quoted-printable, RFC 2231 filenames, and bare XML or compressed
- * bodies.
+ * multipart bodies, forwarded `message/rfc822` attachments, base64, quoted-printable, RFC 2231
+ * filenames, and bare XML or compressed bodies.
  *
  * @example
  * ```ts
  * import { extractRecipient, parseEmailAttachments } from "@domaincanary/dmarc-rua/email";
- * import { parsePayload } from "@domaincanary/dmarc-rua";
+ * import { ParseBudget, ParseError, parsePayload } from "@domaincanary/dmarc-rua";
  *
  * const raw = await Deno.readFile("report-mail.eml");
  * const recipient = extractRecipient(raw);
+ * const budget = new ParseBudget();
  *
  * for (const attachment of parseEmailAttachments(raw)) {
- *   const reports = await parsePayload(attachment.bytes, attachment.filename);
- *   console.log(recipient, reports.length);
+ *   try {
+ *     const reports = await parsePayload(attachment.bytes, attachment.filename, budget);
+ *     console.log(recipient, reports.length);
+ *   } catch (e) {
+ *     // A candidate that is not a report, such as a logo image, throws ParseError. Skip it.
+ *     if (!(e instanceof ParseError)) throw e;
+ *   }
  * }
  * ```
  *
@@ -139,6 +145,12 @@ function walkPart(section: string, depth: number, budget: Budget, out: Part[]): 
 
   const bytes = decodeBody(body, header(headers, "content-transfer-encoding") ?? "");
   if (bytes.byteLength === 0) return;
+  if (contentType.type === "message/rfc822") {
+    // A report forwarded as an attachment: the report is a part of the enclosed message, which is
+    // walked under the same depth and part caps as any other nesting.
+    walkPart(binaryString(bytes), depth + 1, budget, out);
+    return;
+  }
   const disposition = parseTyped(header(headers, "content-disposition"));
   const filename = filenameParam(disposition.params, "filename") ??
     filenameParam(contentType.params, "name");
@@ -455,8 +467,10 @@ function bytesOf(text: string): Uint8Array {
 // --- addresses ---
 
 function firstAddress(value: string): string | null {
-  const angled = /<([^<>]*)>/.exec(value);
-  const candidate = (angled ? angled[1] : value.split(",")[0])
+  // Quoted display names may hold `<`, `>` and `,`, so they go before the address is looked for.
+  const unquoted = value.replace(/"(?:[^"\\]|\\.)*"/g, "");
+  const angled = /<([^<>]*)>/.exec(unquoted);
+  const candidate = (angled ? angled[1] : unquoted.split(",")[0])
     .trim()
     .replace(/^mailto:/i, "")
     .trim();

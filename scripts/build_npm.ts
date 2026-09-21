@@ -113,6 +113,8 @@ await Deno.writeTextFile(
       homepage: "https://github.com/domaincanary/dmarc-rua#readme",
       repository: { type: "git", url: "git+https://github.com/domaincanary/dmarc-rua.git" },
       bugs: { url: "https://github.com/domaincanary/dmarc-rua/issues" },
+      // Without this, Node before 22.7 loads the `export *` files as CommonJS and fails to parse.
+      type: "module",
       module: "./esm/parser.js",
       exports: {
         ".": { types: "./esm/parser.d.ts", import: "./esm/parser.js" },

@@ -15,6 +15,11 @@ export interface ParsedReport {
   dateEnd: number;
   /** The DMARC policy the reporter saw published for the domain. */
   policy: {
+    /**
+     * The domain the report is about, from `<policy_published><domain>`, lowercased. Absent only
+     * on reports built by older callers.
+     */
+    domain?: string | null;
     /** Requested policy for the domain, such as `none`, `quarantine` or `reject`. */
     p: string | null;
     /** Requested policy for subdomains, when the record published one. */
@@ -38,7 +43,7 @@ export interface ParsedReport {
 
 /** One `<auth_results><dkim>` entry: the signature a reporter evaluated for a record. */
 export interface DkimAuthResult {
-  /** The signing domain in the `d=` tag of the signature. */
+  /** The signing domain in the `d=` tag of the signature, lowercased. */
   domain: string | null;
   /** The selector in the `s=` tag of the signature. */
   selector: string | null;
@@ -81,11 +86,11 @@ export interface ParsedRecord {
   dkim: string | null;
   /** The DMARC-evaluated SPF result, which accounts for alignment: `pass` or `fail`. */
   spf: string | null;
-  /** The domain in the `From:` header of the messages. */
+  /** The domain in the `From:` header of the messages, lowercased. */
   headerFrom: string | null;
-  /** The envelope sender domain, when the reporter supplied one. */
+  /** The envelope sender domain, lowercased, when the reporter supplied one. */
   envelopeFrom: string | null;
-  /** The signing domain of the first DKIM auth result, kept for convenience. */
+  /** The signing domain of the first DKIM auth result, lowercased, kept for convenience. */
   dkimDomain: string | null;
   /** The raw result of the first DKIM auth result, kept for convenience. */
   dkimResult: string | null;
@@ -96,10 +101,15 @@ export interface ParsedRecord {
    * records built by older callers.
    */
   reasons?: PolicyReason[];
-  /** The domain checked by SPF. */
+  /**
+   * The domain checked by SPF, lowercased. When a reporter lists several `<spf>` results, this
+   * and the fields below come from the one scoped `mfrom`, or from the first when none is.
+   */
   spfDomain: string | null;
   /** The raw SPF result, before DMARC alignment is applied. */
   spfResult: string | null;
+  /** The identity SPF checked, `mfrom` or `helo`. Absent only on records built by older callers. */
+  spfScope?: string | null;
 }
 
 /** Thrown when no usable report can be extracted from a payload. */

@@ -41,6 +41,7 @@ Deno.test("parsePayload: raw XML metadata and policy", async () => {
   assertEquals(report.dateBegin, 1754956800);
   assertEquals(report.dateEnd, 1755043199);
   assertEquals(report.policy, {
+    domain: "example.com",
     p: "quarantine",
     sp: "none",
     pct: 100,
@@ -69,6 +70,7 @@ Deno.test("parsePayload: record field mapping", async () => {
     reasons: [],
     spfDomain: "example.com",
     spfResult: "pass",
+    spfScope: null,
   });
   // second record: failing, no envelope_from, and two DKIM auth results
   assertEquals(report.records[1], {
@@ -88,6 +90,7 @@ Deno.test("parsePayload: record field mapping", async () => {
     reasons: [],
     spfDomain: "bounce.mailer.test",
     spfResult: "softfail",
+    spfScope: null,
   });
 });
 
@@ -151,7 +154,14 @@ Deno.test("parsePayload: malformed records are skipped and counted", async () =>
   const [report] = await parsePayload(malformedWithEnd(), MALFORMED);
   assertEquals(report.orgName, "tiny-mta.example");
   assertEquals(report.dateEnd, 1755043199);
-  assertEquals(report.policy, { p: "none", sp: null, pct: null, adkim: null, aspf: null });
+  assertEquals(report.policy, {
+    domain: "example.com",
+    p: "none",
+    sp: null,
+    pct: null,
+    adkim: null,
+    aspf: null,
+  });
   assertEquals(report.skippedRecords, 1);
   assertEquals(report.records.length, 1);
   assertEquals(report.records[0].sourceIp, "198.51.100.200");
@@ -573,4 +583,115 @@ Deno.test("parsePayload: a zip with exactly 64 entries is accepted", async () =>
 Deno.test("MAX_DECOMPRESSED_BYTES is generous relative to real reports", () => {
   assertEquals(MAX_DECOMPRESSED_BYTES, 64 * 1024 * 1024);
   assertEquals(MAX_RECORDS_PER_EMAIL, 50_000);
+});
+
+const MINIMAL_RECORD =
+  `<record><row><source_ip>192.0.2.40</source_ip><count>1</count></row></record>`;
+
+function minimalReport(inner: string, declaration = `<?xml version="1.0"?>`): string {
+  return `${declaration}<feedback><report_metadata><org_name>Café Reports</org_name>
+    <report_id>enc-1</report_id><date_range><begin>1754956800</begin><end>1755043199</end>
+    </date_range></report_metadata>${inner}</feedback>`;
+}
+
+Deno.test("parsePayload: lowercases the policy domain and reports a missing one as null", async () => {
+  const present = minimalReport(
+    `<policy_published><domain>Example.COM</domain><p>none</p></policy_published>`,
+  );
+  const [withDomain] = await parsePayload(new TextEncoder().encode(present));
+  assertEquals(withDomain.policy.domain, "example.com");
+
+  const [withoutDomain] = await parsePayload(new TextEncoder().encode(minimalReport("")));
+  assertEquals(withoutDomain.policy.domain, null);
+});
+
+Deno.test("parsePayload: honours a declared ISO-8859-1 encoding", async () => {
+  const xml = minimalReport(MINIMAL_RECORD, `<?xml version="1.0" encoding="ISO-8859-1"?>`);
+  const latin1 = Uint8Array.from(xml, (ch) => ch.charCodeAt(0));
+  const [report] = await parsePayload(latin1);
+  assertEquals(report.orgName, "Café Reports");
+});
+
+Deno.test("parsePayload: decodes UTF-16 with a byte order mark", async () => {
+  const xml = minimalReport(MINIMAL_RECORD, `<?xml version="1.0" encoding="UTF-16"?>`);
+  const utf16 = new Uint8Array(2 + xml.length * 2);
+  const view = new DataView(utf16.buffer);
+  view.setUint16(0, 0xfeff, true);
+  for (let i = 0; i < xml.length; i++) view.setUint16(2 + i * 2, xml.charCodeAt(i), true);
+  const [report] = await parsePayload(utf16);
+  assertEquals(report.orgName, "Café Reports");
+  assertEquals(report.records.length, 1);
+});
+
+Deno.test("parsePayload: falls back to UTF-8 for an unknown declared encoding", async () => {
+  const xml = minimalReport(MINIMAL_RECORD, `<?xml version="1.0" encoding="x-no-such-charset"?>`);
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.orgName, "Café Reports");
+});
+
+Deno.test("parsePayload: element names cannot reshape the parsed object", async () => {
+  const xml = minimalReport(
+    `<__proto__><polluted>yes</polluted>${MINIMAL_RECORD}</__proto__>
+     <constructor>x</constructor>${MINIMAL_RECORD}`,
+  );
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records.length, 1);
+  assertEquals(({} as Record<string, unknown>).polluted, undefined);
+});
+
+Deno.test("parsePayload: prefers the mfrom SPF result over a helo one listed first", async () => {
+  const xml = minimalReport(
+    `<record><row><source_ip>192.0.2.41</source_ip><count>1</count></row>
+     <auth_results>
+       <spf><domain>mta.relay.test</domain><scope>helo</scope><result>fail</result></spf>
+       <spf><domain>Bounce.Example.com</domain><scope>MFROM</scope><result>pass</result></spf>
+     </auth_results></record>`,
+  );
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records[0].spfDomain, "bounce.example.com");
+  assertEquals(report.records[0].spfResult, "pass");
+  assertEquals(report.records[0].spfScope, "mfrom");
+});
+
+Deno.test("parsePayload: lowercases every domain field", async () => {
+  const xml = minimalReport(
+    `<record><row><source_ip>192.0.2.42</source_ip><count>1</count></row>
+     <identifiers><header_from>Example.COM</header_from>
+       <envelope_from>Bounce.Example.COM</envelope_from></identifiers>
+     <auth_results>
+       <dkim><domain>Example.COM</domain><selector>Sel1</selector><result>pass</result></dkim>
+     </auth_results></record>`,
+  );
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  const [record] = report.records;
+  assertEquals(record.headerFrom, "example.com");
+  assertEquals(record.envelopeFrom, "bounce.example.com");
+  assertEquals(record.dkimDomain, "example.com");
+  assertEquals(record.dkimAuthResults, [{
+    domain: "example.com",
+    selector: "Sel1",
+    result: "pass",
+  }]);
+});
+
+Deno.test("parsePayload: reads namespace-prefixed element names", async () => {
+  const xml = minimalReport(MINIMAL_RECORD)
+    .replace("<feedback>", `<dmarc:feedback xmlns:dmarc="urn:ietf:params:xml:ns:dmarc-2.0">`)
+    .replace("</feedback>", "</dmarc:feedback>")
+    .replaceAll("<record>", "<dmarc:record>")
+    .replaceAll("</record>", "</dmarc:record>");
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.records.length, 1);
+});
+
+Deno.test("parsePayload: rejects a report with far more elements than its records could use", async () => {
+  const xml = minimalReport("<a/>".repeat(20_000) + MINIMAL_RECORD);
+  const bytes = new TextEncoder().encode(xml);
+  await assertRejects(
+    () => parsePayload(bytes, undefined, new ParseBudget(undefined, 10)),
+    ParseError,
+    "too many XML elements",
+  );
+  const [report] = await parsePayload(bytes);
+  assertEquals(report.records.length, 1);
 });

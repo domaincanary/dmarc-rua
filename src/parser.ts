@@ -95,6 +95,15 @@ const MAX_POLICY_BYTES = 32;
 const MAX_RECORD_COUNT = 1_000_000_000;
 
 /**
+ * The XML parser builds the whole element tree before any record is examined, and each element
+ * costs a few hundred bytes of heap against as little as four bytes of input (`<a/>`), so the
+ * decompressed-byte cap alone lets a crafted report allocate gigabytes. The tag allowance scales
+ * with the record budget: a complete real record uses about 30 to 60 tags.
+ */
+const XML_TAGS_BASE = 10_000;
+const XML_TAGS_PER_RECORD = 100;
+
+/**
  * Tracks the shared decompressed-byte and record budgets for one email or ingest operation.
  *
  * The defaults are 64 MiB and 50,000 records. Pass custom limits to
@@ -368,8 +377,34 @@ async function parseZip(bytes: Uint8Array, budget: ParseBudget): Promise<ParsedR
   return reports;
 }
 
+const UTF16LE_BOM: readonly number[] = [0xff, 0xfe];
+const UTF16BE_BOM: readonly number[] = [0xfe, 0xff];
+
+/** The `encoding` of an XML declaration, read from the ASCII-compatible head of the document. */
+const XML_DECLARED_ENCODING = /^\s*<\?xml[^>]*?\bencoding\s*=\s*["']([A-Za-z][\w.-]*)["']/;
+
+/**
+ * Pick the decoder a report asks for. Nearly every report is UTF-8, but a few reporters still
+ * declare ISO-8859-1 or windows-1252, and decoding those as UTF-8 turns every accented character
+ * in an org name into U+FFFD. A label the runtime does not know falls back to UTF-8.
+ */
+function decoderFor(bytes: Uint8Array): TextDecoder {
+  if (hasMagic(bytes, UTF16LE_BOM)) return new TextDecoder("utf-16le");
+  if (hasMagic(bytes, UTF16BE_BOM)) return new TextDecoder("utf-16be");
+  const head = String.fromCharCode(...bytes.subarray(0, 256)).replace(/^\xEF\xBB\xBF/, "");
+  const label = XML_DECLARED_ENCODING.exec(head)?.[1];
+  if (label !== undefined) {
+    try {
+      return new TextDecoder(label);
+    } catch {
+      // Unknown label: decode as UTF-8 below.
+    }
+  }
+  return new TextDecoder("utf-8");
+}
+
 function decodeText(bytes: Uint8Array): string {
-  return new TextDecoder("utf-8", { fatal: false }).decode(bytes).replace(/^\uFEFF/, "").trim();
+  return decoderFor(bytes).decode(bytes).replace(/^\uFEFF/, "").trim();
 }
 
 function convertXmlElement(element: XmlElement): unknown {
@@ -385,26 +420,45 @@ function convertXmlElement(element: XmlElement): unknown {
 
   if (childElements.length === 0) return content;
 
-  const converted: Node = {};
+  // Element names are attacker-chosen keys. A null prototype keeps `__proto__` and `constructor`
+  // ordinary properties instead of letting a report reshape the object it is parsed into.
+  const converted: Node = Object.create(null);
   for (const child of childElements) {
+    const name = localName(child.name);
     const value = convertXmlElement(child);
-    const previous = converted[child.name];
-    if (previous === undefined) converted[child.name] = value;
+    const previous = converted[name];
+    if (previous === undefined) converted[name] = value;
     else if (Array.isArray(previous)) previous.push(value);
-    else converted[child.name] = [previous, value];
+    else converted[name] = [previous, value];
   }
   if (content.trim() !== "") converted["#text"] = content;
   return converted;
 }
 
+/** Reject a document with more tags than the record budget could account for, before parsing. */
+function assertTagCountBounded(xml: string, budget: ParseBudget): void {
+  const limit = XML_TAGS_BASE + Math.max(0, budget.remainingRecords) * XML_TAGS_PER_RECORD;
+  let tags = 0;
+  for (let at = xml.indexOf("<"); at !== -1; at = xml.indexOf("<", at + 1)) {
+    if (++tags > limit) throw new ParseError(`report has too many XML elements (over ${limit})`);
+  }
+}
+
+/** The element name without a namespace prefix, so `<dmarc:feedback>` reads as `feedback`. */
+function localName(name: string): string {
+  return name.slice(name.indexOf(":") + 1);
+}
+
 function parseXml(xml: string, budget: ParseBudget): ParsedReport {
+  assertTagCountBounded(xml, budget);
   let doc: Node;
   try {
     const document = rgroveParseXml(xml);
     const root = document.children.find((child): child is XmlElement =>
       child instanceof XmlElement
     );
-    doc = root ? { [root.name]: convertXmlElement(root) } : {};
+    doc = Object.create(null) as Node;
+    if (root) doc[localName(root.name)] = convertXmlElement(root);
   } catch (e) {
     throw new ParseError(`invalid XML: ${errMessage(e)}`);
   }
@@ -452,6 +506,7 @@ function parseXml(xml: string, budget: ParseBudget): ParsedReport {
     dateBegin,
     dateEnd,
     policy: {
+      domain: boundedOrNull(lowerText(policy.domain), MAX_DOMAIN_BYTES),
       p: boundedOrNull(lowerText(policy.p), MAX_POLICY_BYTES),
       sp: boundedOrNull(lowerText(policy.sp), MAX_POLICY_BYTES),
       pct: toInt(policy.pct),
@@ -507,18 +562,19 @@ function parseRecord(raw: unknown, truncated: TruncationCounter): ParsedRecord |
   // fields, so its truncation counts stick even when the guard then discards the record.
   const dkimAuthResults = parseDkimAuthResults(auth.dkim, truncated);
   const dkimAuth = dkimAuthResults[0] ?? { domain: null, selector: null, result: null };
-  const spfAuth = asNode(first(auth.spf)) ?? {};
+  const spfAuth = pickSpfAuthResult(auth.spf);
 
   const values: RecordStrings = {
     disposition: lowerText(evaluated.disposition),
     dkim: lowerText(evaluated.dkim),
     spf: lowerText(evaluated.spf),
-    headerFrom: text(identifiers.header_from),
-    envelopeFrom: text(identifiers.envelope_from),
-    dkimDomain: text(dkimAuth.domain),
-    dkimResult: lowerText(dkimAuth.result),
-    spfDomain: text(spfAuth.domain),
+    headerFrom: lowerText(identifiers.header_from),
+    envelopeFrom: lowerText(identifiers.envelope_from),
+    dkimDomain: dkimAuth.domain,
+    dkimResult: dkimAuth.result,
+    spfDomain: lowerText(spfAuth.domain),
     spfResult: lowerText(spfAuth.result),
+    spfScope: lowerText(spfAuth.scope),
   };
   if (anyFieldTooLong(values)) return null;
 
@@ -547,6 +603,7 @@ type RecordStrings = Pick<
   | "dkimResult"
   | "spfDomain"
   | "spfResult"
+  | "spfScope"
 >;
 
 /**
@@ -562,7 +619,22 @@ function anyFieldTooLong(values: RecordStrings): boolean {
     tooLong(values.dkimDomain, MAX_DOMAIN_BYTES) ||
     tooLong(values.dkimResult, MAX_RESULT_BYTES) ||
     tooLong(values.spfDomain, MAX_DOMAIN_BYTES) ||
-    tooLong(values.spfResult, MAX_RESULT_BYTES);
+    tooLong(values.spfResult, MAX_RESULT_BYTES) ||
+    tooLong(values.spfScope ?? null, MAX_RESULT_BYTES);
+}
+
+/**
+ * A reporter may list one `<spf>` result per checked identity. DMARC aligns on the MAIL FROM
+ * identity, so that result is preferred over a HELO one listed ahead of it. Without an `mfrom`
+ * scope the first result stands, which is also the single-result case.
+ */
+function pickSpfAuthResult(value: unknown): Node {
+  const results = toArray(value);
+  for (const result of results) {
+    const node = asNode(result);
+    if (node && lowerText(node.scope) === "mfrom") return node;
+  }
+  return asNode(results[0]) ?? {};
 }
 
 /** Counts fields shortened or dropped, for `ParsedReport.truncatedFields`. */
@@ -627,7 +699,7 @@ function parseDkimAuthResults(value: unknown, truncated: TruncationCounter): Dki
  */
 function parseDkimAuthResult(node: Node, truncated: TruncationCounter): DkimAuthResult | null {
   const authResult: DkimAuthResult = {
-    domain: text(node.domain),
+    domain: lowerText(node.domain),
     selector: text(node.selector),
     result: lowerText(node.result),
   };
@@ -645,13 +717,22 @@ function parseDkimAuthResult(node: Node, truncated: TruncationCounter): DkimAuth
   return authResult;
 }
 
+const utf8 = new TextEncoder();
+
+/** A UTF-16 code unit encodes to at most 3 UTF-8 bytes, so a short enough string needs no encoding. */
+function fitsWithoutEncoding(value: string, maxBytes: number): boolean {
+  return value.length * 3 <= maxBytes;
+}
+
 function tooLong(value: string | null, maxBytes: number): boolean {
-  return value !== null && new TextEncoder().encode(value).byteLength > maxBytes;
+  if (value === null || fitsWithoutEncoding(value, maxBytes)) return false;
+  return utf8.encode(value).byteLength > maxBytes;
 }
 
 /** Shorten `value` to at most `maxBytes` UTF-8 bytes, never splitting a character in half. */
 function truncateUtf8(value: string, maxBytes: number): string {
-  const bytes = new TextEncoder().encode(value);
+  if (fitsWithoutEncoding(value, maxBytes)) return value;
+  const bytes = utf8.encode(value);
   if (bytes.byteLength <= maxBytes) return value;
   const decoder = new TextDecoder("utf-8", { fatal: true });
   // A UTF-8 character is at most 4 bytes, so a valid boundary is within 3 bytes of the cap.

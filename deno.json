@@ -1,13 +1,13 @@
 {
   "name": "@domaincanary/dmarc-rua",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "license": "MIT",
   "exports": {
     ".": "./src/parser.ts",
     "./email": "./src/email.ts"
   },
   "publish": {
-    "exclude": [".github", "scripts", "npm", "npm-alias"]
+    "exclude": [".github", "scripts", "tests", "npm", "npm-alias"]
   },
   "imports": {
     "@deno/dnt": "jsr:@deno/dnt@^0.42.1",
