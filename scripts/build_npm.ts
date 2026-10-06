@@ -52,7 +52,7 @@ await build({
       "xml",
       "cloudflare-workers",
     ],
-    homepage: "https://github.com/domaincanary/dmarc-rua#readme",
+    homepage: "https://domaincanary.com/?ref=dmarc-rua-npm",
     repository: {
       type: "git",
       url: "git+https://github.com/domaincanary/dmarc-rua.git",
@@ -110,7 +110,7 @@ await Deno.writeTextFile(
         "xml",
         "cloudflare-workers",
       ],
-      homepage: "https://github.com/domaincanary/dmarc-rua#readme",
+      homepage: "https://domaincanary.com/?ref=dmarc-rua-npm",
       repository: { type: "git", url: "git+https://github.com/domaincanary/dmarc-rua.git" },
       bugs: { url: "https://github.com/domaincanary/dmarc-rua/issues" },
       // Without this, Node before 22.7 loads the `export *` files as CommonJS and fails to parse.
