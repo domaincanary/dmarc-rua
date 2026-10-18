@@ -30,7 +30,30 @@ export interface ParsedReport {
     adkim?: string | null;
     /** SPF alignment mode, `r` for relaxed or `s` for strict. */
     aspf?: string | null;
+    /**
+     * Requested policy for subdomains that do not exist (DMARC 2.0, RFC 9990), such as `none`,
+     * `quarantine` or `reject`. Null when the reporter did not send one, which is every RFC 7489
+     * report. Absent only on reports built by older callers.
+     */
+    np?: string | null;
+    /**
+     * The record's test mode as the reporter saw it (DMARC 2.0, RFC 9990): `y` when the record
+     * published `t=y`, `n` when it did not. Null when the reporter did not send one. Absent only
+     * on reports built by older callers.
+     */
+    testing?: string | null;
+    /**
+     * How the reporter found the record (DMARC 2.0, RFC 9990): `psl` or `treewalk`. Null when the
+     * reporter did not send one. Absent only on reports built by older callers.
+     */
+    discoveryMethod?: string | null;
   };
+  /**
+   * The software that wrote the report, from `<report_metadata><generator>` (DMARC 2.0, RFC 9990),
+   * with its case kept. Null when the reporter did not send one. Absent only on reports built by
+   * older callers.
+   */
+  generator?: string | null;
   /** The records parsed from the report, one per source IP and result combination. */
   records: ParsedRecord[];
   /** Count of `<record>` elements rejected as malformed or left unparsed by the record budget. */

@@ -15,6 +15,8 @@ import { fixtureBytes, fixtureText, gzip, gzipZeros, zip, zipRaw } from "./fixtu
 const GOOGLE = "google_report.xml";
 const YAHOO = "yahoo_report.xml";
 const MALFORMED = "malformed_report.xml";
+/** The sample report from RFC 9990 (DMARC 2.0) Appendix B, re-indented. */
+const DMARC2 = "dmarc2_report.xml";
 
 /** The malformed fixture has an empty <end>, which is now fatal; give it a usable one. */
 function malformedWithEnd(end = 1755043199): Uint8Array {
@@ -47,7 +49,11 @@ Deno.test("parsePayload: raw XML metadata and policy", async () => {
     pct: 100,
     adkim: "r",
     aspf: "r",
+    np: null,
+    testing: null,
+    discoveryMethod: null,
   });
+  assertEquals(report.generator, null);
   assertEquals(report.records.length, 3);
   assertEquals(report.skippedRecords, 0);
 });
@@ -161,6 +167,9 @@ Deno.test("parsePayload: malformed records are skipped and counted", async () =>
     pct: null,
     adkim: null,
     aspf: null,
+    np: null,
+    testing: null,
+    discoveryMethod: null,
   });
   assertEquals(report.skippedRecords, 1);
   assertEquals(report.records.length, 1);
@@ -694,4 +703,74 @@ Deno.test("parsePayload: rejects a report with far more elements than its record
   );
   const [report] = await parsePayload(bytes);
   assertEquals(report.records.length, 1);
+});
+
+Deno.test("parsePayload: keeps the DMARC 2.0 policy fields and generator (RFC 9990 sample)", async () => {
+  const [report] = await parsePayload(fixtureBytes(DMARC2), DMARC2);
+  assertEquals(report.orgName, "Sample Reporter");
+  assertEquals(report.generator, "Example DMARC Aggregate Reporter v1.2");
+  assertEquals(report.policy, {
+    domain: "example.com",
+    p: "quarantine",
+    sp: "none",
+    pct: null,
+    adkim: null,
+    aspf: null,
+    np: "none",
+    testing: "n",
+    discoveryMethod: "treewalk",
+  });
+  assertEquals(report.records.length, 1);
+  assertEquals(report.records[0].disposition, "pass");
+  assertEquals(report.truncatedFields, undefined);
+});
+
+Deno.test("parsePayload: RFC 7489 reports carry no DMARC 2.0 fields, so they read as null", async () => {
+  for (const name of [GOOGLE, YAHOO]) {
+    const [report] = await parsePayload(fixtureBytes(name), name);
+    assertEquals(report.policy.np, null, name);
+    assertEquals(report.policy.testing, null, name);
+    assertEquals(report.policy.discoveryMethod, null, name);
+    assertEquals(report.generator, null, name);
+  }
+});
+
+Deno.test("parsePayload: DMARC 2.0 fields under a namespace prefix, in any case", async () => {
+  const xml = fixtureText(DMARC2)
+    .replace(/<(\/?)(?!\?)([a-z_]+)(\s[^>]*)?>/g, "<$1dmarc:$2$3>")
+    .replace("<dmarc:feedback xmlns=", "<dmarc:feedback xmlns:dmarc=")
+    .replace("<dmarc:np>none</dmarc:np>", "<dmarc:np> REJECT </dmarc:np>")
+    .replace("<dmarc:testing>n</dmarc:testing>", "<dmarc:testing>Y</dmarc:testing>")
+    .replace("treewalk", "PSL");
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.policy.np, "reject");
+  assertEquals(report.policy.testing, "y");
+  assertEquals(report.policy.discoveryMethod, "psl");
+  assertEquals(report.generator, "Example DMARC Aggregate Reporter v1.2");
+});
+
+Deno.test("parsePayload: bounds the DMARC 2.0 fields and counts each one shortened", async () => {
+  const long = "x".repeat(40);
+  const xml = `<feedback><report_metadata><date_range><end>2</end></date_range>
+    <generator>${"g".repeat(300)}</generator></report_metadata>
+    <policy_published><np>${long}</np><testing>${long}</testing>
+      <discovery_method>${long}</discovery_method></policy_published></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.generator?.length, 255);
+  assertEquals(report.policy.np?.length, 32);
+  assertEquals(report.policy.testing?.length, 32);
+  assertEquals(report.policy.discoveryMethod?.length, 32);
+  assertEquals(report.truncatedFields, 4);
+});
+
+Deno.test("parsePayload: empty DMARC 2.0 elements read as null", async () => {
+  const xml = `<feedback><report_metadata><date_range><end>2</end></date_range>
+    <generator>  </generator></report_metadata>
+    <policy_published><np/><testing></testing><discovery_method> </discovery_method>
+    </policy_published></feedback>`;
+  const [report] = await parsePayload(new TextEncoder().encode(xml));
+  assertEquals(report.generator, null);
+  assertEquals(report.policy.np, null);
+  assertEquals(report.policy.testing, null);
+  assertEquals(report.policy.discoveryMethod, null);
 });
