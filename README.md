@@ -173,9 +173,11 @@ Returns the lowercased envelope recipient when available, preferring `X-Original
 The root export provides `ParsedReport`, `ParsedRecord`, `DkimAuthResult`, `PolicyReason`, and
 `ParseError`. `ParsedReport` includes report metadata, published policy (including the `domain` the
 report is about and the `adkim` and `aspf` alignment modes), parsed records, and partial-recovery
-counters. `ParsedRecord` contains the source IP, message count, evaluated DMARC results, identifiers
-(domains are lowercased), authentication results (the `mfrom` SPF result when a reporter lists
-several), the complete ordered DKIM auth results in `dkimAuthResults` (capped at
+counters. From DMARC 2.0 (RFC 9990) reports it also keeps `np`, `testing` and `discoveryMethod` in
+the published policy and the report's `generator`; each is `null` when the reporter did not send it,
+as on every RFC 7489 report. `ParsedRecord` contains the source IP, message count, evaluated DMARC
+results, identifiers (domains are lowercased), authentication results (the `mfrom` SPF result when a
+reporter lists several), the complete ordered DKIM auth results in `dkimAuthResults` (capped at
 `MAX_DKIM_AUTH_RESULTS_PER_RECORD`), and policy override reasons in `reasons` (capped at
 `MAX_POLICY_REASONS_PER_RECORD`). Entries dropped by either cap are counted in `truncatedFields`.
 The email subpath exports `EmailAttachment`, whose fields are `bytes` and an optional `filename`.

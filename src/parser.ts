@@ -87,6 +87,7 @@ const MAX_FUTURE_SKEW_SECONDS = 7 * DEFAULT_WINDOW_SECONDS;
 
 const MAX_ORG_NAME_BYTES = 255;
 const MAX_REPORT_ID_BYTES = 512;
+const MAX_GENERATOR_BYTES = 255;
 const MAX_DOMAIN_BYTES = 253;
 const MAX_ENVELOPE_FROM_BYTES = 320;
 const MAX_RESULT_BYTES = 64;
@@ -484,6 +485,7 @@ function parseXml(xml: string, budget: ParseBudget): ParsedReport {
     text(meta.report_id) ?? `${orgName}-${dateBegin}-${dateEnd}`,
     MAX_REPORT_ID_BYTES,
   );
+  const generator = boundedOrNull(text(meta.generator), MAX_GENERATOR_BYTES);
 
   const records: ParsedRecord[] = [];
   let skippedRecords = 0;
@@ -512,7 +514,11 @@ function parseXml(xml: string, budget: ParseBudget): ParsedReport {
       pct: toInt(policy.pct),
       adkim: boundedOrNull(lowerText(policy.adkim), MAX_POLICY_BYTES),
       aspf: boundedOrNull(lowerText(policy.aspf), MAX_POLICY_BYTES),
+      np: boundedOrNull(lowerText(policy.np), MAX_POLICY_BYTES),
+      testing: boundedOrNull(lowerText(policy.testing), MAX_POLICY_BYTES),
+      discoveryMethod: boundedOrNull(lowerText(policy.discovery_method), MAX_POLICY_BYTES),
     },
+    generator,
     records,
     skippedRecords,
     recordsParsed,
